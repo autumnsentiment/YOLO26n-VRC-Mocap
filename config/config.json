@@ -1,0 +1,220 @@
+{
+    "camera": {
+        "camera_id": 1,
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "flip_horizontal": true
+    },
+    "yolo": {
+        "model_path": "yolo26n-pose.pt",
+        "model_type": "nano",
+        "device": "auto",
+        "precision": "fp16",
+        "conf_threshold": 0.5,
+        "half": true
+    },
+    "streaming": {
+        "body": {
+            "host": "127.0.0.1",
+            "port": 9000,
+            "protocol": "osc",
+            "streaming_enabled": true,
+            "tracker_toggles": {
+                "Hips": true,
+                "Chest": true,
+                "LeftLowerArm": true,
+                "RightLowerArm": true,
+                "LeftFoot": true,
+                "RightFoot": true,
+                "LeftLowerLeg": true,
+                "RightLowerLeg": true
+            },
+            "send_position": true,
+            "send_rotation": true,
+            "send_head_position": false,
+            "steamvr": {
+                "smoothing": 50,
+                "additional_smoothing": 0.5,
+                "camera_latency": 0,
+                "hmd_to_neck_offset": [
+                    0,
+                    -0.2,
+                    0.1
+                ],
+                "trackers": [
+                    {
+                        "body_part": "Hips",
+                        "role": "TrackerRole_Waist"
+                    },
+                    {
+                        "body_part": "Chest",
+                        "role": "TrackerRole_Chest"
+                    },
+                    {
+                        "body_part": "LeftFoot",
+                        "role": "TrackerRole_LeftFoot"
+                    },
+                    {
+                        "body_part": "RightFoot",
+                        "role": "TrackerRole_RightFoot"
+                    },
+                    {
+                        "body_part": "LeftKnee",
+                        "role": "TrackerRole_LeftKnee"
+                    },
+                    {
+                        "body_part": "RightKnee",
+                        "role": "TrackerRole_RightKnee"
+                    },
+                    {
+                        "body_part": "LeftElbow",
+                        "role": "TrackerRole_LeftElbow"
+                    },
+                    {
+                        "body_part": "RightElbow",
+                        "role": "TrackerRole_RightElbow"
+                    }
+                ]
+            }
+        },
+        "face": {
+            "host": "127.0.0.1",
+            "port": 9000,
+            "streaming_enabled": true,
+            "vmc_port": 39539
+        },
+        "hand": {
+            "host": "127.0.0.1",
+            "port": 9000,
+            "streaming_enabled": true,
+            "vmt_host": "127.0.0.1",
+            "vmt_port": 39570
+        }
+    },
+    "vrc": {
+        "host": "127.0.0.1",
+        "port": 9000,
+        "protocol": "osc",
+        "tracker_toggles": {
+            "Hips": true,
+            "Chest": true,
+            "LeftLowerArm": true,
+            "RightLowerArm": true,
+            "LeftFoot": true,
+            "RightFoot": true,
+            "LeftLowerLeg": true,
+            "RightLowerLeg": true
+        },
+        "send_position": true,
+        "send_rotation": true,
+        "send_head_position": false
+    },
+    "steamvr": {
+        "smoothing": 50,
+        "additional_smoothing": 0.5,
+        "camera_latency": 0,
+        "hmd_to_neck_offset": [
+            0,
+            -0.2,
+            0.1
+        ],
+        "trackers": [
+            {
+                "body_part": "Hips",
+                "role": "TrackerRole_Waist"
+            },
+            {
+                "body_part": "Chest",
+                "role": "TrackerRole_Chest"
+            },
+            {
+                "body_part": "LeftFoot",
+                "role": "TrackerRole_LeftFoot"
+            },
+            {
+                "body_part": "RightFoot",
+                "role": "TrackerRole_RightFoot"
+            },
+            {
+                "body_part": "LeftKnee",
+                "role": "TrackerRole_LeftKnee"
+            },
+            {
+                "body_part": "RightKnee",
+                "role": "TrackerRole_RightKnee"
+            },
+            {
+                "body_part": "LeftElbow",
+                "role": "TrackerRole_LeftElbow"
+            },
+            {
+                "body_part": "RightElbow",
+                "role": "TrackerRole_RightElbow"
+            }
+        ]
+    },
+    "display": {
+        "show_preview": true,
+        "window_name": "YOLO26n VRC Mocap",
+        "draw_skeleton": true
+    },
+    "processing": {
+        "smoothing": "one_euro",
+        "smoothing_factor": 0.3,
+        "one_euro_min_cutoff": 1,
+        "one_euro_beta": 0.007
+    },
+    "face": {
+        "enabled": true,
+        "min_detection_confidence": 0.5,
+        "min_tracking_confidence": 0.5,
+        "smoothing": "one_euro",
+        "smoothing_factor": 0.3,
+        "one_euro_min_cutoff": 1,
+        "one_euro_beta": 0.007,
+        "min_face_presence_confidence": 0.5,
+        "blendshape_smoothing": 0.4,
+        "head_position_scale": 1,
+        "head_position_offset": [
+            0,
+            0,
+            0
+        ],
+        "head_rotation_smoothing": 0.3
+    },
+    "hand": {
+        "enabled": true,
+        "max_num_hands": 2,
+        "min_detection_confidence": 0.6,
+        "min_tracking_confidence": 0.5,
+        "one_euro_min_cutoff": 1,
+        "one_euro_beta": 0.01,
+        "palm_back_classify": true,
+        "back_curl_compensation": 1.25,
+        "back_roll_compensation": 0.15
+    },
+    "body": {
+        "enabled": true,
+        "detect_torso": true,
+        "detect_left_arm": true,
+        "detect_right_arm": true,
+        "detect_left_leg": true,
+        "detect_right_leg": true
+    },
+    "hmd": {
+        "provider": "remote",
+        "osc_listen_port": 9001,
+        "pico_host": "127.0.0.1",
+        "pico_port": 7890,
+        "quest_host": "127.0.0.1",
+        "quest_port": 53342,
+        "remote_port": 4243,
+        "dashboard_host": "127.0.0.1",
+        "dashboard_port": 8765,
+        "pico_xrobo_host": "0.0.0.0",
+        "pico_xrobo_port": 39540,
+        "quest_udp_host": "0.0.0.0",
+        "quest_udp_port": 39541
+    }
+}

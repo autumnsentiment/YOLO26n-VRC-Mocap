@@ -1,0 +1,73 @@
+# YOLO26n 姿态估计数据集配置模板
+# 使用方法: 复制此文件，修改路径和类别，然后运行 train.py --data <此文件路径>
+
+# 数据集根目录（绝对路径或相对于此文件的路径）
+path: ./my_dataset
+
+# 训练/验证/测试图像目录（相对于 path）
+train: images/train
+val: images/val
+# test: images/test  # 可选
+
+# 类别数量
+nc: 1
+
+# 关键点形状 [关键点数, 每点维度]
+# COCO 17 关键点, 每点 (x, y, visibility)
+kpt_shape: [17, 3]
+
+# 类别名称 (ID: 名称)
+names:
+  0: person
+
+# ============================================================
+# 数据集目录结构:
+#
+#   my_dataset/
+#   ├── images/
+#   │   ├── train/        <- 训练图像
+#   │   │   ├── img001.jpg
+#   │   │   ├── img002.jpg
+#   │   │   └── ...
+#   │   └── val/          <- 验证图像
+#   │       ├── img101.jpg
+#   │       └── ...
+#   ├── labels/
+#   │   ├── train/        <- 训练标签
+#   │   │   ├── img001.txt
+#   │   │   └── ...
+#   │   └── val/          <- 验证标签
+#   │       ├── img101.txt
+#   │       └── ...
+#   └── dataset.yaml      <- 本文件
+#
+# ============================================================
+# 标签格式 (姿态估计，每行一个目标):
+#
+#   class cx cy w h kp1_x kp1_y kp1_v kp2_x kp2_y kp2_v ... kp17_x kp17_y kp17_v
+#
+#   - class: 类别ID (0=person)
+#   - cx, cy: 边界框中心坐标 (归一化 0-1)
+#   - w, h: 边界框宽高 (归一化 0-1)
+#   - kp_x, kp_y: 关键点坐标 (归一化 0-1)
+#   - kp_v: 关键点可见性 (0=不在图像内, 1=遮挡, 2=可见)
+#
+# COCO 17 关键点顺序:
+#   0: nose          1: left_eye      2: right_eye     3: left_ear
+#   4: right_ear     5: left_shoulder 6: right_shoulder 7: left_elbow
+#   8: right_elbow   9: left_wrist   10: right_wrist  11: left_hip
+#   12: right_hip   13: left_knee   14: right_knee   15: left_ankle
+#   16: right_ankle
+#
+# 示例标签行 (56个值):
+#   0 0.512 0.534 0.261 0.487 0.507 0.273 2 0.496 0.254 2 0.528 0.258 2 0.479 0.261 2 0.556 0.265 2 0.423 0.342 2 0.601 0.346 2 0.367 0.421 2 0.657 0.425 2 0.331 0.498 2 0.693 0.502 2 0.445 0.598 2 0.579 0.602 2 0.412 0.746 2 0.612 0.750 2 0.398 0.891 2 0.626 0.895 2
+#
+# ============================================================
+# 快速创建数据集:
+#
+#   python train.py --create-dataset ./my_dataset
+#
+# 从 COCO 格式转换 (需要 pycocotools):
+#   python -c "from ultralytics.data.converter import coco80_to_coco91_class; ..."
+#
+# ============================================================

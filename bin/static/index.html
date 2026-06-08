@@ -1,0 +1,2577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLO26n VRC Mocap Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #0f1117; --card: #1a1d27; --border: #2a2d3a;
+  --text: #e0e0e0; --text-dim: #888; --accent: #6c5ce7;
+  --accent-hover: #7d6ff0; --success: #00b894; --danger: #e74c3c;
+  --warning: #fdcb6e;
+}
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+.header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.header h1 span { color: var(--accent); }
+.status-badge { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+.status-running { background: rgba(0,184,148,0.15); color: var(--success); }
+.status-stopped { background: rgba(231,76,60,0.15); color: var(--danger); }
+.status-warning { background: rgba(243,156,18,0.15); color: #f39c12; }
+
+.container { max-width: 1800px; margin: 0 auto; padding: 24px; padding-bottom: 160px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
+.container .full-width { grid-column: 1 / -1; }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+.card-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+.card-title .icon { width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; background: var(--accent); border-radius: 6px; font-size: 11px; }
+
+.form-group { margin-bottom: 14px; }
+.form-group:last-child { margin-bottom: 0; }
+.form-label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
+.form-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+select, input[type="number"], input[type="text"] {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); padding: 8px 12px; font-size: 13px; width: 100%;
+  outline: none; transition: border-color 0.2s;
+}
+select { cursor: pointer; }
+select:focus, input:focus { border-color: var(--accent); }
+select:disabled, input:disabled { opacity: 0.5; cursor: not-allowed; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+input[type="range"] {
+  -webkit-appearance: none; width: 100%; height: 6px; border-radius: 3px;
+  background: var(--border); outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--accent); cursor: pointer;
+}
+
+.range-row { display: flex; align-items: center; gap: 12px; }
+.range-row input[type="range"] { flex: 1; }
+.range-value { min-width: 50px; text-align: right; font-size: 13px; color: var(--accent); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.btn { padding: 8px 20px; border-radius: 8px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-success { background: var(--success); color: #fff; }
+.btn-success:hover { opacity: 0.9; }
+.btn-danger { background: var(--danger); color: #fff; }
+.btn-danger:hover { opacity: 0.9; }
+.btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+
+.btn-group { display: flex; gap: 10px; margin-top: 16px; }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+
+.toggle { position: relative; width: 44px; height: 24px; cursor: pointer; }
+.toggle input { display: none; }
+.toggle-slider { position: absolute; inset: 0; background: var(--border); border-radius: 12px; transition: 0.2s; }
+.toggle-slider::before { content: ''; position: absolute; width: 18px; height: 18px; border-radius: 50%; background: #fff; left: 3px; top: 3px; transition: 0.2s; }
+.toggle input:checked + .toggle-slider { background: var(--accent); }
+.toggle input:checked + .toggle-slider::before { transform: translateX(20px); }
+
+.toggle-row { display: flex; align-items: center; justify-content: space-between; }
+.toggle-label { font-size: 13px; }
+
+.toast { position: fixed; bottom: 140px; right: 28px; padding: 12px 20px; border-radius: 8px; font-size: 13px; font-weight: 500; opacity: 0; transform: translateY(10px); transition: all 0.3s; z-index: 1000; pointer-events: none; max-width: 360px; }
+.toast.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+.toast-success { background: var(--success); color: #fff; }
+.toast-error { background: var(--danger); color: #fff; }
+
+/* 悬浮操作栏 */
+.fab-group { position: fixed; bottom: 28px; right: 28px; display: flex; flex-direction: column; align-items: center; gap: 10px; z-index: 999; }
+.fab-power { width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 24px; transition: all 0.25s; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
+.fab-power.off { background: var(--success); color: #fff; box-shadow: 0 4px 20px rgba(0,184,148,0.4); }
+.fab-power.off:hover { opacity: 0.85; }
+.fab-power.on { background: var(--danger); color: #fff; box-shadow: 0 4px 20px rgba(231,76,60,0.4); }
+.fab-power.on:hover { opacity: 0.85; }
+.fab-power .power-icon { display: inline-block; width: 24px; height: 24px; }
+.fab-power .power-icon svg { width: 100%; height: 100%; }
+.fab-sm { padding: 10px 16px; border-radius: 10px; border: none; cursor: pointer; font-size: 12px; font-weight: 600; transition: all 0.2s; box-shadow: 0 2px 10px rgba(0,0,0,0.3); }
+.fab-sm.fab-save { background: var(--accent); color: #fff; }
+.fab-sm.fab-save:hover { background: var(--accent-hover); }
+.fab-sm.fab-reload { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+.fab-sm.fab-reload:hover { border-color: var(--accent); color: var(--accent); }
+
+.hardware-info { background: var(--bg); border-radius: 8px; padding: 12px; margin-top: 8px; }
+.hw-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 13px; }
+.hw-dot { width: 8px; height: 8px; border-radius: 50%; }
+.hw-dot.available { background: var(--success); }
+.hw-dot.unavailable { background: var(--danger); }
+.hw-name { flex: 1; }
+.hw-tag { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(108,92,231,0.15); color: var(--accent); }
+
+.section-divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+
+@media (max-width: 1200px) {
+  .container { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 900px) {
+  .container { grid-template-columns: 1fr; }
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  .container { padding: 16px; padding-bottom: 160px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>YOLO26n</span> VRC Mocap Dashboard</h1>
+  <span id="statusBadge" class="status-badge status-stopped">STOPPED</span>
+  <div id="staleProcessInfo" style="display:none; align-items:center; margin-left:8px;"></div>
+</div>
+
+<div class="container">
+
+  <!-- 硬件设置 -->
+  <div class="card">
+    <div class="card-title"><span class="icon">H</span> 推理硬件</div>
+    <div class="form-group">
+      <label class="form-label">推理设备</label>
+      <select id="device">
+        <option value="auto">自动选择</option>
+        <option value="cuda">GPU (CUDA)</option>
+        <option value="cpu">CPU</option>
+      </select>
+    </div>
+    <div class="hardware-info" id="hardwareInfo">
+      <div class="hw-item"><span class="hw-dot available"></span><span class="hw-name">Detecting...</span></div>
+    </div>
+    <hr class="section-divider">
+    <div class="form-group">
+      <label class="form-label">摄像头选择</label>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <select id="cameraId" style="flex:1;"></select>
+        <button class="btn btn-outline" style="padding:6px 12px; font-size:11px;" onclick="refreshCameras()">刷新检测</button>
+      </div>
+      <div id="cameraInfo" style="font-size:11px; color:var(--text-dim); margin-top:4px;">检测中...</div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">分辨率宽</label>
+        <input type="number" id="cameraWidth" value="1280" min="320" max="3840" step="160">
+      </div>
+      <div class="form-group">
+        <label class="form-label">分辨率高</label>
+        <input type="number" id="cameraHeight" value="720" min="240" max="2160" step="120">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">帧率</label>
+      <input type="number" id="cameraFps" value="30" min="10" max="120" step="5">
+    </div>
+    <div class="toggle-row" style="margin-bottom:0">
+      <span class="toggle-label">水平翻转</span>
+      <label class="toggle"><input type="checkbox" id="cameraFlip" checked><span class="toggle-slider"></span></label>
+    </div>
+    <hr class="section-divider">
+    <div class="form-group">
+      <label class="form-label">模型路径</label>
+      <input type="text" id="modelPath" placeholder="yolo26n-pose.pt">
+    </div>
+    <div class="form-group">
+      <label class="form-label">算法精度 (快速切换)</label>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button class="btn btn-outline" style="padding:4px 10px; font-size:11px;" onclick="switchInferenceModel('nano')">Nano 极速</button>
+        <button class="btn btn-outline" style="padding:4px 10px; font-size:11px;" onclick="switchInferenceModel('small')">Small 均衡</button>
+        <button class="btn btn-outline" style="padding:4px 10px; font-size:11px;" onclick="switchInferenceModel('medium')">Medium 高精度</button>
+        <button class="btn btn-outline" style="padding:4px 10px; font-size:11px;" onclick="switchInferenceModel('large')">Large 最高精度</button>
+        <button class="btn btn-outline" style="padding:4px 10px; font-size:11px;" onclick="switchInferenceModel('custom')">自定义路径</button>
+      </div>
+      <div id="inferenceModelDesc" style="font-size:11px; color:var(--text-dim); margin-top:4px;">
+        当前: Nano (yolo26n-pose.pt) - 极速推理
+      </div>
+    </div>
+    <hr class="section-divider">
+    <div class="form-group">
+      <label class="form-label">推理精度</label>
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn-outline precision-btn" data-precision="fp32" onclick="selectPrecision('fp32')" style="flex:1; padding:8px; font-size:12px;">FP32<br><span style="font-size:10px; color:var(--text-dim);">全精度</span></button>
+        <button class="btn btn-primary precision-btn" data-precision="fp16" onclick="selectPrecision('fp16')" style="flex:1; padding:8px; font-size:12px;">FP16<br><span style="font-size:10px; opacity:0.8;">半精度</span></button>
+        <button class="btn btn-outline precision-btn" data-precision="int8" onclick="selectPrecision('int8')" style="flex:1; padding:8px; font-size:12px;">INT8<br><span style="font-size:10px; color:var(--text-dim);">量化</span></button>
+      </div>
+      <div id="precisionDesc" style="font-size:11px; color:var(--text-dim); margin-top:6px;">
+        FP16: 半精度浮点，GPU推理速度提升约2倍，精度损失极小
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">置信度阈值</label>
+      <div class="range-row">
+        <input type="range" id="confThreshold" min="0.1" max="0.95" step="0.05" value="0.5">
+        <span class="range-value" id="confThresholdVal">0.50</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 身体姿态识别 -->
+  <div class="card">
+    <div class="card-title"><span class="icon">B</span> 身体姿态识别</div>
+    <div class="toggle-row" style="margin-bottom:14px">
+      <span class="toggle-label">启用身体追踪</span>
+      <span id="bodyInferenceStatus" class="inference-status" style="font-size:11px; padding:2px 8px; border-radius:4px; margin-right:8px; display:none;"></span>
+      <label class="toggle"><input type="checkbox" id="bodyEnabled" checked><span class="toggle-slider"></span></label>
+    </div>
+    <!-- Pipeline 模式指示器 -->
+    <div id="pipelineIndicator" style="background:var(--bg); border-radius:8px; padding:10px 14px; margin-bottom:14px; display:flex; align-items:center; gap:10px;">
+      <div id="pipelineIcon" style="width:36px; height:36px; border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:16px; font-weight:700; background:var(--accent); color:#fff;">1</div>
+      <div>
+        <div id="pipelineName" style="font-size:13px; font-weight:600;">Pipeline 1: 完整检测</div>
+        <div id="pipelineDesc" style="font-size:11px; color:var(--text-dim);">YOLO26n + MediaPipe (身体+面部+手部)</div>
+      </div>
+    </div>
+    <div id="bodySettings">
+      <div style="font-size:12px; color:var(--text-dim); margin-bottom:8px;">推理开关: 关闭部位后跳过该部位推理，减少计算量</div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; background:var(--bg); padding:8px 12px; border-radius:8px;">
+          <input type="checkbox" id="detectTorso" checked> 躯干 (髋/胸/颈)
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; background:var(--bg); padding:8px 12px; border-radius:8px;">
+          <input type="checkbox" id="detectLeftArm" checked> 左臂 (上臂/肘/手)
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; background:var(--bg); padding:8px 12px; border-radius:8px;">
+          <input type="checkbox" id="detectRightArm" checked> 右臂 (上臂/肘/手)
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; background:var(--bg); padding:8px 12px; border-radius:8px;">
+          <input type="checkbox" id="detectLeftLeg" checked> 左腿 (大腿/膝/脚)
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; background:var(--bg); padding:8px 12px; border-radius:8px;">
+          <input type="checkbox" id="detectRightLeg" checked> 右腿 (大腿/膝/脚)
+        </label>
+      </div>
+      <hr class="section-divider">
+      <div style="font-size:12px; color:var(--accent); font-weight:600; margin-bottom:6px;">OSC 追踪器推流</div>
+      <div style="font-size:11px; color:var(--text-dim); margin-bottom:6px;">独立控制: 推理开关关闭时对应追踪器自动关闭，但可单独开启推理而关闭推流</div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;" id="trackerToggles">
+        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; background:var(--bg); padding:4px 10px; border-radius:6px;">
+          <input type="checkbox" class="tracker-toggle" data-bone="Hips" checked> 髋部
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; background:var(--bg); padding:4px 10px; border-radius:6px;">
+          <input type="checkbox" class="tracker-toggle" data-bone="Chest" checked> 胸部
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; background:var(--bg); padding:4px 10px; border-radius:6px;">
+          <input type="checkbox" class="tracker-toggle" data-bone="LeftLowerArm" checked> 左肘
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; background:var(--bg); padding:4px 10px; border-radius:6px;">
+          <input type="checkbox" class="tracker-toggle" data-bone="RightLowerArm" checked> 右肘
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; background:var(--bg); padding:4px 10px; border-radius:6px;">
+          <input type="checkbox" class="tracker-toggle" data-bone="LeftFoot" checked> 左脚
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; background:var(--bg); padding:4px 10px; border-radius:6px;">
+          <input type="checkbox" class="tracker-toggle" data-bone="RightFoot" checked> 右脚
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; background:var(--bg); padding:4px 10px; border-radius:6px;">
+          <input type="checkbox" class="tracker-toggle" data-bone="LeftLowerLeg" checked> 左膝
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; background:var(--bg); padding:4px 10px; border-radius:6px;">
+          <input type="checkbox" class="tracker-toggle" data-bone="RightLowerLeg" checked> 右膝
+        </label>
+      </div>
+      <div style="margin-top:8px; font-size:11px; color:var(--text-dim);">
+        提示: 坐姿模式可关闭腿部识别，仅使用上半身追踪
+      </div>
+      <hr class="section-divider">
+      <div style="font-size:12px; color:var(--accent); font-weight:600; margin-bottom:6px;">姿态平滑</div>
+      <div class="form-group">
+        <label class="form-label">平滑算法</label>
+        <select id="procSmoothing">
+          <option value="one_euro">OneEuro (推荐)</option>
+          <option value="linear">线性插值</option>
+        </select>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">min_cutoff</label>
+          <div class="range-row">
+            <input type="range" id="procMinCutoff" min="0.1" max="3.0" step="0.1" value="1.0">
+            <span class="range-value" id="procMinCutoffVal">1.0</span>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">beta</label>
+          <div class="range-row">
+            <input type="range" id="procBeta" min="0.001" max="0.1" step="0.001" value="0.007">
+            <span class="range-value" id="procBetaVal">0.007</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 嘴部识别 -->
+  <div class="card">
+    <div class="card-title"><span class="icon">F</span> 嘴部识别</div>
+    <div class="toggle-row" style="margin-bottom:14px">
+      <span class="toggle-label">启用面部追踪</span>
+      <span id="faceInferenceStatus" class="inference-status" style="font-size:11px; padding:2px 8px; border-radius:4px; margin-right:8px; display:none;"></span>
+      <label class="toggle"><input type="checkbox" id="faceEnabled" checked><span class="toggle-slider"></span></label>
+    </div>
+    <div id="faceSettings">
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">检测置信度</label>
+          <div class="range-row">
+            <input type="range" id="faceDetConf" min="0.1" max="0.9" step="0.05" value="0.5">
+            <span class="range-value" id="faceDetConfVal">0.50</span>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">追踪置信度</label>
+          <div class="range-row">
+            <input type="range" id="faceTrkConf" min="0.1" max="0.9" step="0.05" value="0.5">
+            <span class="range-value" id="faceTrkConfVal">0.50</span>
+          </div>
+        </div>
+      </div>
+      <hr class="section-divider">
+      <div class="form-group">
+        <label class="form-label">平滑算法</label>
+        <select id="faceSmoothing">
+          <option value="one_euro">OneEuro (推荐)</option>
+          <option value="linear">线性插值</option>
+        </select>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">OneEuro min_cutoff (低频平滑)</label>
+          <div class="range-row">
+            <input type="range" id="faceMinCutoff" min="0.1" max="3.0" step="0.1" value="1.0">
+            <span class="range-value" id="faceMinCutoffVal">1.0</span>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">OneEuro beta (速度平滑)</label>
+          <div class="range-row">
+            <input type="range" id="faceBeta" min="0.001" max="0.1" step="0.001" value="0.007">
+            <span class="range-value" id="faceBetaVal">0.007</span>
+          </div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">线性插值平滑系数</label>
+        <div class="range-row">
+          <input type="range" id="faceSmoothFactor" min="0.05" max="1.0" step="0.05" value="0.3">
+          <span class="range-value" id="faceSmoothFactorVal">0.30</span>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Blendshape 平滑 (表情去抖)</label>
+        <div class="range-row">
+          <input type="range" id="blendshapeSmoothing" min="0" max="0.8" step="0.05" value="0.4">
+          <span class="range-value" id="blendshapeSmoothingVal">0.40</span>
+        </div>
+      </div>
+      <hr class="section-divider">
+      <div style="font-size:12px; color:var(--accent); font-weight:600; margin-bottom:8px;">佩戴头显优化</div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">面部存在置信度</label>
+          <div class="range-row">
+            <input type="range" id="facePresenceConf" min="0.1" max="0.9" step="0.05" value="0.5">
+            <span class="range-value" id="facePresenceConfVal">0.50</span>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">头部旋转平滑</label>
+          <div class="range-row">
+            <input type="range" id="headRotSmoothing" min="0" max="0.8" step="0.05" value="0.3">
+            <span class="range-value" id="headRotSmoothingVal">0.30</span>
+          </div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">头部位置缩放</label>
+          <div class="range-row">
+            <input type="range" id="headPosScale" min="0.5" max="3.0" step="0.1" value="1.0">
+            <span class="range-value" id="headPosScaleVal">1.0</span>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">头部位置偏移 Y</label>
+          <div class="range-row">
+            <input type="range" id="headPosYOffset" min="-0.3" max="0.3" step="0.01" value="0">
+            <span class="range-value" id="headPosYOffsetVal">0.00</span>
+          </div>
+        </div>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:var(--text-dim);">
+        佩戴头显建议: 面部存在置信度=0.3, 旋转平滑=0.3, 位置缩放=1.5~2.0
+      </div>
+    </div>
+  </div>
+
+  <!-- 手指关节识别 -->
+  <div class="card">
+    <div class="card-title"><span class="icon">G</span> 手指关节识别</div>
+    <div class="toggle-row" style="margin-bottom:14px">
+      <span class="toggle-label">启用手部追踪</span>
+      <span id="handInferenceStatus" class="inference-status" style="font-size:11px; padding:2px 8px; border-radius:4px; margin-right:8px; display:none;"></span>
+      <label class="toggle"><input type="checkbox" id="handEnabled" checked><span class="toggle-slider"></span></label>
+    </div>
+    <div id="handSettings">
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">检测置信度</label>
+          <div class="range-row">
+            <input type="range" id="handDetConf" min="0.1" max="0.9" step="0.05" value="0.6">
+            <span class="range-value" id="handDetConfVal">0.60</span>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">追踪置信度</label>
+          <div class="range-row">
+            <input type="range" id="handTrkConf" min="0.1" max="0.9" step="0.05" value="0.5">
+            <span class="range-value" id="handTrkConfVal">0.50</span>
+          </div>
+        </div>
+      </div>
+      <hr class="section-divider">
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">OneEuro min_cutoff (低频平滑)</label>
+          <div class="range-row">
+            <input type="range" id="handMinCutoff" min="0.1" max="3.0" step="0.1" value="1.0">
+            <span class="range-value" id="handMinCutoffVal">1.0</span>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">OneEuro beta (速度平滑)</label>
+          <div class="range-row">
+            <input type="range" id="handBeta" min="0.001" max="0.1" step="0.001" value="0.01">
+            <span class="range-value" id="handBetaVal">0.010</span>
+          </div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">最大检测手数</label>
+        <select id="handMaxNum">
+          <option value="1">单手</option>
+          <option value="2" selected>双手</option>
+        </select>
+      </div>
+      <hr class="section-divider">
+      <div class="card-title" style="font-size:13px; margin-bottom:10px;">手掌/手背分类</div>
+      <div class="toggle-row" style="margin-bottom:10px">
+        <span class="toggle-label">启用手掌/手背分类</span>
+        <label class="toggle"><input type="checkbox" id="palmBackClassify" checked><span class="toggle-slider"></span></label>
+      </div>
+      <div id="palmBackSettings">
+        <div class="grid-2">
+          <div class="form-group">
+            <label class="form-label">手背弯曲度补偿</label>
+            <div class="range-row">
+              <input type="range" id="backCurlComp" min="1.0" max="1.5" step="0.05" value="1.25">
+              <span class="range-value" id="backCurlCompVal">1.25</span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">手背手腕旋转补偿</label>
+            <div class="range-row">
+              <input type="range" id="backRollComp" min="0.0" max="0.3" step="0.01" value="0.15">
+              <span class="range-value" id="backRollCompVal">0.15</span>
+            </div>
+          </div>
+        </div>
+        <div style="font-size:11px; color:var(--text-dim); margin-top:4px;">
+          手背朝向时2D投影角度偏小，补偿系数用于还原真实弯曲度；手腕旋转补偿修正手背时的roll偏差
+        </div>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:var(--text-dim);">
+        手部追踪使用 MediaPipe Hands 检测 21 个关键点，计算手指弯曲度、手腕旋转和手指张开度
+      </div>
+    </div>
+  </div>
+
+  <!-- 推流管理 -->
+  <div class="card">
+    <div class="card-title"><span class="icon">V</span> 推流管理</div>
+    <div style="font-size:11px; color:var(--text-dim); margin-bottom:12px;">
+      每个模块拥有独立的 OSC 推流地址和开关，可独立启停
+    </div>
+
+    <!-- ===== 身体姿态推流 ===== -->
+    <div style="font-size:12px; color:var(--accent); font-weight:600; margin-bottom:8px;">身体姿态推流</div>
+    <div class="grid-2" style="margin-bottom:8px;">
+      <div class="form-group">
+        <label class="form-label">身体 OSC 地址</label>
+        <input type="text" id="bodyHost" value="127.0.0.1">
+      </div>
+      <div class="form-group">
+        <label class="form-label">身体 OSC 端口</label>
+        <input type="number" id="bodyPort" value="9000" min="1" max="65535">
+      </div>
+    </div>
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+      <div class="form-group" style="margin-bottom:0; flex:1; min-width:120px;">
+        <label class="form-label">推流协议</label>
+        <select id="bodyProtocol" onchange="onProtocolChange()">
+          <option value="osc">OSC (VRChat)</option>
+          <option value="steamvr">SteamVR (管道驱动)</option>
+        </select>
+      </div>
+      <div class="toggle-row" style="margin-bottom:0;">
+        <span class="toggle-label">推流</span>
+        <label class="toggle"><input type="checkbox" id="bodyStreamingEnabled" checked><span class="toggle-slider"></span></label>
+      </div>
+    </div>
+    <!-- SteamVR 参数 (仅 steamvr 协议时显示) -->
+    <div id="steamvrParams" style="display:none; margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">平滑度</label>
+          <input type="number" id="steamvrSmoothing" value="50" min="1" max="100">
+        </div>
+        <div class="form-group">
+          <label class="form-label">额外平滑</label>
+          <input type="number" id="steamvrAdditionalSmoothing" value="0.5" min="0" max="1" step="0.05">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">摄像头延迟 (秒)</label>
+        <input type="number" id="steamvrCameraLatency" value="0" min="0" max="0.5" step="0.01">
+      </div>
+    </div>
+    <!-- OSC 数据传输控制 -->
+    <div id="oscParams" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+      <div style="display:flex; gap:12px; margin-bottom:6px; flex-wrap:wrap;">
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+          <input type="checkbox" id="sendPosition" checked> 发送位置
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+          <input type="checkbox" id="sendRotation" checked> 发送旋转
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+          <input type="checkbox" id="sendHeadPosition"> 头部坐标推流
+        </label>
+      </div>
+    </div>
+
+    <hr class="section-divider">
+
+    <!-- ===== 面部表情推流 ===== -->
+    <div style="font-size:12px; color:#fdcb6e; font-weight:600; margin-bottom:8px;">面部表情推流</div>
+    <div class="grid-3" style="margin-bottom:8px;">
+      <div class="form-group">
+        <label class="form-label">面部 OSC 地址</label>
+        <input type="text" id="faceHost" value="127.0.0.1">
+      </div>
+      <div class="form-group">
+        <label class="form-label">面部 OSC 端口</label>
+        <input type="number" id="facePort" value="9000" min="1" max="65535">
+      </div>
+      <div class="form-group">
+        <label class="form-label">VMC 端口</label>
+        <input type="number" id="vmcPort" value="39539" min="1" max="65535">
+      </div>
+    </div>
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:8px; padding:6px 8px; background:rgba(253,203,110,0.06); border-radius:6px;">
+      <span style="font-size:12px; font-weight:600; min-width:60px;">面部表情</span>
+      <div class="toggle-row" style="margin-bottom:0;">
+        <span class="toggle-label">推流</span>
+        <label class="toggle"><input type="checkbox" id="faceStreamingEnabled" checked><span class="toggle-slider"></span></label>
+      </div>
+    </div>
+    <div style="font-size:11px; color:var(--text-dim);">面部 blendshape 通过 VMC 协议发送，面部参数通过独立 OSC 地址发送到 VRChat</div>
+
+    <hr class="section-divider">
+
+    <!-- ===== 手部追踪推流 ===== -->
+    <div style="font-size:12px; color:var(--success); font-weight:600; margin-bottom:8px;">手部追踪推流</div>
+    <div class="grid-2" style="margin-bottom:8px;">
+      <div class="form-group">
+        <label class="form-label">手部 OSC 地址</label>
+        <input type="text" id="handHost" value="127.0.0.1">
+      </div>
+      <div class="form-group">
+        <label class="form-label">手部 OSC 端口</label>
+        <input type="number" id="handPort" value="9000" min="1" max="65535">
+      </div>
+    </div>
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:8px; padding:6px 8px; background:rgba(0,184,148,0.06); border-radius:6px;">
+      <span style="font-size:12px; font-weight:600; min-width:60px;">手部追踪</span>
+      <div class="form-group" style="margin-bottom:0; flex:1; min-width:100px;">
+        <label class="form-label">VMT 推流地址</label>
+        <input type="text" id="vmtHost" value="127.0.0.1">
+      </div>
+      <div class="form-group" style="margin-bottom:0; min-width:100px;">
+        <label class="form-label">VMT 端口</label>
+        <input type="number" id="vmtPort" value="39570" min="1" max="65535">
+      </div>
+      <div class="toggle-row" style="margin-bottom:0;">
+        <span class="toggle-label">推流</span>
+        <label class="toggle"><input type="checkbox" id="handStreamingEnabled" checked><span class="toggle-slider"></span></label>
+      </div>
+    </div>
+    <div style="font-size:11px; color:var(--text-dim);">手部位姿通过 VMT 协议发送到 OpenVR 驱动层，手指弯曲度通过独立 OSC 地址发送</div>
+  </div>
+
+  <!-- SteamVR 追踪器配置 -->
+  <div class="card" id="steamvrCard">
+    <div class="card-title"><span class="icon">S</span> SteamVR 追踪器</div>
+    <!-- 驱动安装 -->
+    <div class="form-group">
+      <label class="form-label">管道驱动</label>
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <span id="svDriverSt" style="font-size:12px; color:var(--text-dim);">--</span>
+        <button class="btn btn-primary" id="svInstallBtn" onclick="svInstallDriver()" style="font-size:12px; padding:4px 14px;">安装驱动</button>
+        <button class="btn btn-outline" id="svInstallVrpathBtn" onclick="svInstallVrpath()" style="font-size:12px; padding:4px 14px;">注册路径</button>
+        <button class="btn btn-danger" id="svUninstallBtn" onclick="svUninstallDriver()" style="font-size:12px; padding:4px 14px; display:none;">卸载驱动</button>
+        <button class="btn btn-outline" onclick="svCheckStatus()" style="font-size:12px; padding:4px 14px;">检测状态</button>
+      </div>
+      <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">
+        <b>安装驱动</b>: 复制驱动文件到 SteamVR 目录 (推荐) &nbsp;|&nbsp;
+        <b>注册路径</b>: 写入 openvrpaths.vrpath (无需复制文件)
+      </div>
+    </div>
+    <hr class="section-divider">
+    <!-- 追踪器数量 -->
+    <div class="form-group">
+      <label class="form-label">追踪器数量</label>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <input type="number" id="svTrackerCount" value="8" min="1" max="11" style="width:70px;" onchange="svUpdateTrackerCount()">
+        <span style="font-size:11px; color:var(--text-dim);">1~11，修改后自动增删追踪器行</span>
+      </div>
+    </div>
+    <!-- 追踪器列表 -->
+    <div class="form-group">
+      <label class="form-label">追踪器部位绑定</label>
+      <div id="svTrackerRows" style="display:flex; flex-direction:column; gap:6px;"></div>
+    </div>
+  </div>
+
+  <!-- HMD 位姿配置 -->
+  <div class="card" id="hmdCard">
+    <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
+      <span><span class="icon">H</span> HMD 位姿数据源</span>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <label style="display:flex; align-items:center; gap:4px; font-size:11px; cursor:pointer;">
+          <input type="checkbox" id="hmdEnable" onchange="onHmdToggle()"> 启用
+        </label>
+        <button class="btn btn-outline" onclick="hmdCheckStatus()" style="font-size:11px; padding:2px 10px;">检测</button>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">数据来源</label>
+      <select id="hmdProvider" onchange="onHmdProviderChange()" style="width:100%;" disabled>
+        <option value="static">无 (使用动捕推断坐标)</option>
+        <option value="auto">自动检测</option>
+        <option value="openvr">OpenVR (SteamVR)</option>
+        <option value="vrchat_osc">VRChat OSC 反馈</option>
+        <option value="pico">Pico Streaming (串流助手)</option>
+        <option value="pico_xrobo">Pico XR-Robotics (UDP)</option>
+        <option value="quest">Quest Link (SteamVR/OVR)</option>
+        <option value="quest_udp">Quest MetaQuest_HandTracking (UDP)</option>
+        <option value="remote">远程 HMD (网络回传)</option>
+      </select>
+      <div style="font-size:11px; color:var(--text-dim); margin-top:4px;">
+        读取 VR 头显的真实世界坐标，替代动捕推断的头部位置，提高追踪精度
+      </div>
+    </div>
+    <!-- VRChat OSC 参数 -->
+    <div id="hmdOscParams" style="display:none;">
+      <div class="form-group">
+        <label class="form-label">OSC 监听端口</label>
+        <input type="number" id="hmdOscPort" value="9001" min="1024" max="65535">
+        <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">VRChat 发送追踪数据的端口</div>
+      </div>
+    </div>
+    <!-- Pico Streaming 参数 -->
+    <div id="hmdPicoParams" style="display:none;">
+      <div class="form-group">
+        <label class="form-label">Pico Streaming 地址</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="hmdPicoHost" value="127.0.0.1" style="flex:2;">
+          <input type="number" id="hmdPicoPort" value="7890" min="1024" max="65535" style="flex:1;">
+        </div>
+        <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">Pico Streaming Assistant HTTP API 地址</div>
+      </div>
+    </div>
+    <!-- Pico XR-Robotics 参数 -->
+    <div id="hmdPicoXRoboParams" style="display:none;">
+      <div class="form-group">
+        <label class="form-label">UDP 监听地址</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="hmdPicoXRoboHost" value="0.0.0.0" style="flex:2;">
+          <input type="number" id="hmdPicoXRoboPort" value="39540" min="1024" max="65535" style="flex:1;">
+        </div>
+        <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">
+          接收 Pico 头显通过 XRoboToolkit APK 发送的位姿数据 (UDP)
+        </div>
+      </div>
+      <div style="font-size:11px; color:var(--accent); background:rgba(108,92,231,0.1); border-radius:6px; padding:8px; margin-top:4px;">
+        使用方式: 在 Pico 头显安装 XRoboToolkit Unity APK，头显与 PC 同一 WiFi 下，APK 发送位姿到 PC 的此端口<br>
+        参考: github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind
+      </div>
+    </div>
+    <!-- Quest Link 参数 -->
+    <div id="hmdQuestParams" style="display:none;">
+      <div class="form-group">
+        <label class="form-label">Quest Link 地址</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="hmdQuestHost" value="127.0.0.1" style="flex:2;">
+          <input type="number" id="hmdQuestPort" value="53342" min="1024" max="65535" style="flex:1;">
+        </div>
+        <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">OVR Runtime HTTP API 地址 (优先使用 OpenVR)</div>
+      </div>
+    </div>
+    <!-- Quest UDP 参数 -->
+    <div id="hmdQuestUDPParams" style="display:none;">
+      <div class="form-group">
+        <label class="form-label">UDP 监听地址</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="hmdQuestUDPHost" value="0.0.0.0" style="flex:2;">
+          <input type="number" id="hmdQuestUDPPort" value="39541" min="1024" max="65535" style="flex:1;">
+        </div>
+        <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">
+          接收 Quest 头显通过 MetaQuest_HandTracking APK 发送的位姿数据 (UDP)
+        </div>
+      </div>
+      <div style="font-size:11px; color:var(--accent); background:rgba(108,92,231,0.1); border-radius:6px; padding:8px; margin-top:4px;">
+        使用方式: 在 Quest 头显安装 MetaQuest_HandTracking Unity APK，头显与 PC 同一 WiFi 下，APK 发送位姿到 PC 的此端口<br>
+        参考: github.com/kodaekwan/MetaQuest_HandTracking
+      </div>
+    </div>
+    <!-- 远程 HMD 参数 -->
+    <div id="hmdRemoteParams" style="display:none;">
+      <div class="form-group">
+        <label class="form-label">UDP 监听端口</label>
+        <input type="number" id="hmdRemotePort" value="4243" min="1024" max="65535">
+        <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">接收远程 hmd_sender.py 发送的位姿数据</div>
+      </div>
+    </div>
+    <!-- HMD 状态与位姿 -->
+    <div class="form-group">
+      <label class="form-label">连接状态</label>
+      <div id="hmdStatus" style="font-size:12px; color:var(--text-dim);">未连接</div>
+    </div>
+    <!-- 实时位姿显示 -->
+    <div id="hmdPoseDisplay" style="display:none; background:var(--bg); border-radius:8px; padding:10px; font-family:monospace; font-size:11px; line-height:1.6;">
+      <div style="color:var(--accent); font-weight:600; margin-bottom:4px;">实时位姿</div>
+      <div>位置: <span id="hmdPosePos">--</span></div>
+      <div>旋转: <span id="hmdPoseRot">--</span></div>
+      <div>有效: <span id="hmdPoseValid">--</span></div>
+      <div>数据源: <span id="hmdProviderName">--</span></div>
+    </div>
+  </div>
+
+  <!-- 运行日志 -->
+  <div class="card full-width" id="logCard">
+    <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
+      <span><span class="icon">L</span> 运行日志</span>
+      <div style="display:flex; gap:6px;">
+        <button class="btn btn-outline" onclick="refreshLog()" style="font-size:11px; padding:2px 10px;">刷新</button>
+        <label style="display:flex; align-items:center; gap:4px; font-size:11px; cursor:pointer;">
+          <input type="checkbox" id="logAutoRefresh" checked> 自动刷新
+        </label>
+      </div>
+    </div>
+    <div id="logContent" style="background:var(--bg); border-radius:8px; padding:12px; font-family:monospace; font-size:12px; max-height:200px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; color:var(--text-dim); line-height:1.5;">
+      等待动捕启动...
+    </div>
+  </div>
+
+  <!-- 数据集管理 -->
+  <div class="card full-width">
+    <div class="card-title"><span class="icon">D</span> 数据集管理</div>
+
+    <!-- 导入数据集 -->
+    <div class="form-group">
+      <label class="form-label">快捷导入数据集</label>
+      <div class="form-row" style="gap:8px">
+        <input type="text" id="importPath" placeholder="输入数据集路径 (如 D:\datasets\coco-pose)" style="flex:1">
+        <button class="btn btn-outline" onclick="openFolderBrowser()" style="white-space:nowrap">浏览...</button>
+        <input type="text" id="importName" placeholder="名称 (可选)" style="width:120px">
+        <button class="btn btn-primary" onclick="importDataset(false)" style="white-space:nowrap">复制导入</button>
+        <button class="btn btn-outline" onclick="importDataset(true)" style="white-space:nowrap">链接导入</button>
+      </div>
+      <div style="margin-top:6px; font-size:12px; color:var(--text-dim);">
+        复制导入: 复制数据集到项目目录 | 链接导入: 创建符号链接 (节省空间, 需管理员权限)
+      </div>
+    </div>
+
+    <hr class="section-divider">
+
+    <!-- 创建空数据集 -->
+    <div class="form-group">
+      <label class="form-label">创建空数据集</label>
+      <div class="form-row" style="gap:8px">
+        <input type="text" id="createName" placeholder="数据集名称" style="flex:1">
+        <button class="btn btn-outline" onclick="createDataset()">创建</button>
+      </div>
+      <div style="margin-top:6px; font-size:12px; color:var(--text-dim);">
+        创建标准目录结构 (images/train, images/val, labels/train, labels/val) 和 dataset.yaml
+      </div>
+    </div>
+
+    <hr class="section-divider">
+
+    <!-- 已导入数据集列表 -->
+    <div class="form-group">
+      <label class="form-label">已导入数据集</label>
+      <div id="datasetList" style="background:var(--bg); border-radius:8px; padding:12px; min-height:40px;">
+        <div style="color:var(--text-dim); font-size:13px;">加载中...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模型训练 -->
+  <div class="card full-width">
+    <div class="card-title"><span class="icon">T</span> 模型训练</div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">选择数据集</label>
+        <select id="trainDataset">
+          <option value="">-- 请选择数据集 --</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">训练设备</label>
+        <select id="trainDevice">
+          <option value="auto">自动选择</option>
+          <option value="cuda">GPU (CUDA)</option>
+          <option value="cpu">CPU</option>
+        </select>
+      </div>
+    </div>
+    <!-- 算法精度选择 -->
+    <div class="form-group">
+      <label class="form-label">算法精度等级</label>
+      <div id="modelPresetCards" style="display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:4px;">
+        <div class="preset-card" data-type="nano" onclick="selectModelPreset('nano')" style="background:var(--bg); border:2px solid var(--accent); border-radius:10px; padding:10px; cursor:pointer; transition:all 0.2s;">
+          <div style="font-size:13px; font-weight:600; color:var(--accent);">Nano</div>
+          <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">极速</div>
+          <div style="font-size:10px; color:var(--success); margin-top:4px;">~3M ~5ms</div>
+        </div>
+        <div class="preset-card" data-type="small" onclick="selectModelPreset('small')" style="background:var(--bg); border:2px solid var(--border); border-radius:10px; padding:10px; cursor:pointer; transition:all 0.2s;">
+          <div style="font-size:13px; font-weight:600;">Small</div>
+          <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">均衡</div>
+          <div style="font-size:10px; color:var(--warning); margin-top:4px;">~11M ~10ms</div>
+        </div>
+        <div class="preset-card" data-type="medium" onclick="selectModelPreset('medium')" style="background:var(--bg); border:2px solid var(--border); border-radius:10px; padding:10px; cursor:pointer; transition:all 0.2s;">
+          <div style="font-size:13px; font-weight:600;">Medium</div>
+          <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">高精度</div>
+          <div style="font-size:10px; color:var(--warning); margin-top:4px;">~26M ~20ms</div>
+        </div>
+        <div class="preset-card" data-type="large" onclick="selectModelPreset('large')" style="background:var(--bg); border:2px solid var(--border); border-radius:10px; padding:10px; cursor:pointer; transition:all 0.2s;">
+          <div style="font-size:13px; font-weight:600;">Large</div>
+          <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">最高精度</div>
+          <div style="font-size:10px; color:var(--danger); margin-top:4px;">~44M ~40ms</div>
+        </div>
+      </div>
+      <div id="presetDesc" style="font-size:11px; color:var(--text-dim); margin-top:6px;">
+        Nano: 最小模型，最快推理速度，适合边缘设备
+      </div>
+    </div>
+    <div class="grid-3">
+      <div class="form-group">
+        <label class="form-label">训练轮数</label>
+        <input type="number" id="trainEpochs" value="100" min="1" max="1000">
+      </div>
+      <div class="form-group">
+        <label class="form-label">批次大小</label>
+        <input type="number" id="trainBatch" value="16" min="-1" max="128">
+        <div style="font-size:10px; color:var(--text-dim); margin-top:2px;">-1 自动根据显存调整</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">图像尺寸</label>
+        <input type="number" id="trainImgsz" value="640" min="320" max="1280" step="32">
+      </div>
+    </div>
+    <div class="grid-3">
+      <div class="form-group">
+        <label class="form-label">初始学习率</label>
+        <input type="number" id="trainLr0" value="0.01" min="0.0001" max="0.1" step="0.001">
+      </div>
+      <div class="form-group">
+        <label class="form-label">优化器</label>
+        <select id="trainOptimizer">
+          <option value="auto">自动</option>
+          <option value="SGD">SGD</option>
+          <option value="Adam">Adam</option>
+          <option value="AdamW">AdamW</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">早停耐心值</label>
+        <input type="number" id="trainPatience" value="50" min="0" max="200">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">冻结层数 (微调)</label>
+        <input type="number" id="trainFreeze" value="0" min="0" max="24">
+      </div>
+      <div class="form-group">
+        <label class="form-label">标签平滑</label>
+        <input type="number" id="trainLabelSmoothing" value="0.0" min="0" max="0.1" step="0.01">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="toggle-row">
+        <span class="toggle-label">混合精度 (AMP)</span>
+        <label class="toggle"><input type="checkbox" id="trainAmp" checked><span class="toggle-slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">余弦退火学习率</span>
+        <label class="toggle"><input type="checkbox" id="trainCosLr" checked><span class="toggle-slider"></span></label>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">实验名称 (可选)</label>
+        <input type="text" id="trainName" placeholder="自动生成">
+      </div>
+      <div class="toggle-row" style="margin-top:8px">
+        <span class="toggle-label">手掌/手背分割训练</span>
+        <label class="toggle"><input type="checkbox" id="trainHandSplit"><span class="toggle-slider"></span></label>
+      </div>
+    </div>
+    <div style="font-size:11px; color:var(--text-dim); margin-top:4px;">
+      将数据集按手掌/手背分割为两个子数据集，分别训练专用模型，提高手部识别精度
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-success" id="btnTrainStart" onclick="startTraining()">开始训练</button>
+      <button class="btn btn-danger" id="btnTrainStop" onclick="stopTraining()" disabled>停止训练</button>
+    </div>
+    <div id="trainStatusText" style="margin-top:10px; font-size:13px; color:var(--text-dim);"></div>
+
+    <hr class="section-divider">
+
+    <!-- 已训练模型 -->
+    <div class="form-group">
+      <label class="form-label">已训练模型</label>
+      <div id="modelList" style="background:var(--bg); border-radius:8px; padding:12px; min-height:40px;">
+        <div style="color:var(--text-dim); font-size:13px;">加载中...</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- 文件夹浏览弹窗 -->
+<!-- 分布分析图弹窗 -->
+<div id="analysisModal" style="display:none; position:fixed; inset:0; z-index:1100; background:rgba(0,0,0,0.6); align-items:center; justify-content:center;">
+  <div style="background:var(--card); border:1px solid var(--border); border-radius:12px; width:90vw; max-width:1100px; max-height:85vh; display:flex; flex-direction:column;">
+    <div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between;">
+      <span style="font-weight:600; font-size:15px;" id="analysisTitle">关键点命中分布分析</span>
+      <button style="background:none; border:none; color:var(--text-dim); cursor:pointer; font-size:18px;" onclick="closeAnalysis()">&times;</button>
+    </div>
+    <div id="analysisContent" style="padding:16px 20px; overflow-y:auto; flex:1;">
+      <div style="color:var(--text-dim); text-align:center; padding:40px;">加载中...</div>
+    </div>
+  </div>
+</div>
+
+<div id="folderModal" style="display:none; position:fixed; inset:0; z-index:1100; background:rgba(0,0,0,0.6); align-items:center; justify-content:center;">
+  <div style="background:var(--card); border:1px solid var(--border); border-radius:12px; width:560px; max-height:70vh; display:flex; flex-direction:column;">
+    <div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between;">
+      <span style="font-weight:600; font-size:15px;">选择数据集文件夹</span>
+      <button style="background:none; border:none; color:var(--text-dim); cursor:pointer; font-size:18px;" onclick="closeFolderBrowser()">&times;</button>
+    </div>
+    <!-- 路径栏 -->
+    <div style="padding:10px 20px; border-bottom:1px solid var(--border); display:flex; gap:8px; align-items:center;">
+      <button class="btn btn-outline" style="padding:4px 10px; font-size:12px;" onclick="browseGoParent()">↑ 上级</button>
+      <input type="text" id="browsePathInput" style="flex:1; font-size:12px; padding:6px 10px;" placeholder="输入路径后回车跳转" onkeydown="if(event.key==='Enter')browseGoTo(this.value)">
+      <button class="btn btn-outline" style="padding:4px 10px; font-size:12px;" onclick="browseGoTo(document.getElementById('browsePathInput').value)">跳转</button>
+    </div>
+    <!-- 快捷入口 -->
+    <div id="browseShortcuts" style="padding:8px 20px; border-bottom:1px solid var(--border); display:none; flex-wrap:wrap; gap:6px;"></div>
+    <!-- 目录列表 -->
+    <div id="browseList" style="flex:1; overflow-y:auto; padding:8px 0; min-height:200px;">
+      <div style="color:var(--text-dim); font-size:13px; padding:20px; text-align:center;">加载中...</div>
+    </div>
+    <!-- 底部操作 -->
+    <div style="padding:12px 20px; border-top:1px solid var(--border); display:flex; align-items:center; justify-content:space-between;">
+      <span id="browseCurrentPath" style="font-size:12px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:300px;"></span>
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn-outline" onclick="closeFolderBrowser()">取消</button>
+        <button class="btn btn-primary" id="btnSelectFolder" onclick="selectCurrentFolder()">选择此文件夹</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============ 工具函数 ============
+
+function showToast(msg, type = 'success') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast toast-' + type + ' show';
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+async function api(path, method = 'GET', body = null) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(path, opts);
+  return res.json();
+}
+
+// 绑定 range 显示值
+function bindRange(id) {
+  const el = document.getElementById(id);
+  const val = document.getElementById(id + 'Val');
+  if (!el || !val) return;
+  el.addEventListener('input', () => {
+    val.textContent = parseFloat(el.value).toFixed(el.step.includes('.') ? el.step.split('.')[1].length : 0);
+  });
+}
+
+// ============ 摄像头管理 ============
+
+async function refreshCameras() {
+  const sel = document.getElementById('cameraId');
+  const info = document.getElementById('cameraInfo');
+  sel.innerHTML = '<option value="">检测中...</option>';
+  info.textContent = '正在检测摄像头...';
+  try {
+    const r = await api('/api/cameras', 'GET');
+    sel.innerHTML = '';
+    if (r.cameras.length === 0) {
+      sel.innerHTML = '<option value="">未检测到摄像头</option>';
+      info.textContent = '未检测到任何摄像头，请检查连接后点击刷新检测';
+      return;
+    }
+    r.cameras.forEach(c => {
+      const o = document.createElement('option');
+      o.value = c.id;
+      o.textContent = c.name;
+      sel.appendChild(o);
+    });
+    sel.value = r.current;
+    // 选中后自动更新分辨率和帧率
+    onCameraChange(r.cameras);
+    info.textContent = `检测到 ${r.cameras.length} 个摄像头`;
+    info.style.color = 'var(--success)';
+    setTimeout(() => { info.style.color = 'var(--text-dim)'; }, 2000);
+  } catch (e) {
+    sel.innerHTML = '<option value="">检测失败</option>';
+    info.textContent = '摄像头检测失败: ' + e.message;
+    info.style.color = 'var(--danger)';
+  }
+}
+
+function onCameraChange(cameras) {
+  const sel = document.getElementById('cameraId');
+  const id = parseInt(sel.value);
+  if (cameras) {
+    const cam = cameras.find(c => c.id === id);
+    if (cam) {
+      document.getElementById('cameraWidth').value = cam.width || 1280;
+      document.getElementById('cameraHeight').value = cam.height || 720;
+      document.getElementById('cameraFps').value = cam.fps || 30;
+    }
+  }
+}
+
+// ============ 加载配置 ============
+
+async function loadConfig() {
+  try {
+    const [config, hw] = await Promise.all([api('/api/config'), api('/api/hardware')]);
+
+    // Camera
+    const cam = config.camera || {};
+    document.getElementById('cameraWidth').value = cam.width || 1280;
+    document.getElementById('cameraHeight').value = cam.height || 720;
+    document.getElementById('cameraFps').value = cam.fps || 30;
+    document.getElementById('cameraFlip').checked = cam.flip_horizontal !== false;
+    // 异步加载摄像头列表并设置选中
+    refreshCameras().then(() => {
+      document.getElementById('cameraId').value = cam.camera_id ?? 0;
+    });
+
+    // YOLO
+    const yolo = config.yolo || {};
+    document.getElementById('device').value = yolo.device || 'auto';
+    document.getElementById('modelPath').value = yolo.model_path || 'yolo26n-pose.pt';
+    document.getElementById('confThreshold').value = yolo.conf_threshold || 0.5;
+    document.getElementById('confThresholdVal').textContent = (yolo.conf_threshold || 0.5).toFixed(2);
+
+    // 推理精度
+    const precision = yolo.precision || 'fp16';
+    selectPrecision(precision);
+
+    // 更新推理模型描述
+    const modelType = yolo.model_type || 'nano';
+    const inferInfo = _inferenceModelMap[modelType];
+    if (inferInfo) {
+      document.getElementById('inferenceModelDesc').textContent = '当前: ' + inferInfo.desc;
+    }
+
+    // 硬件信息
+    const hwInfo = document.getElementById('hardwareInfo');
+    const deviceSelect = document.getElementById('device');
+    const trainDevSel = document.getElementById('trainDevice');
+    // 清除旧 GPU 选项
+    deviceSelect.querySelectorAll('option[data-gpu]').forEach(o => o.remove());
+    trainDevSel.querySelectorAll('option[data-gpu]').forEach(o => o.remove());
+    hwInfo.innerHTML = '';
+    for (const d of hw.devices) {
+      if (d.id !== 'cpu' && d.id.startsWith('cuda:')) {
+        // 添加具体 GPU 选项 (cuda:0, cuda:1, ...)
+        const opt = document.createElement('option');
+        opt.value = d.id; opt.textContent = d.name; opt.dataset.gpu = '1';
+        if (!d.available) opt.disabled = true;
+        deviceSelect.appendChild(opt);
+        const topt = opt.cloneNode(true);
+        trainDevSel.appendChild(topt);
+      }
+      hwInfo.innerHTML += `<div class="hw-item">
+        <span class="hw-dot ${d.available ? 'available' : 'unavailable'}"></span>
+        <span class="hw-name">${d.name}</span>
+        ${d.id === hw.current || (hw.current === 'auto' && d.id.startsWith('cuda:') && d.available) ? '<span class="hw-tag">当前</span>' : ''}
+      </div>`;
+    }
+
+    // Body
+    const body = config.body || {};
+    document.getElementById('bodyEnabled').checked = body.enabled !== false;
+    document.getElementById('detectTorso').checked = body.detect_torso !== false;
+    document.getElementById('detectLeftArm').checked = body.detect_left_arm !== false;
+    document.getElementById('detectRightArm').checked = body.detect_right_arm !== false;
+    document.getElementById('detectLeftLeg').checked = body.detect_left_leg !== false;
+    document.getElementById('detectRightLeg').checked = body.detect_right_leg !== false;
+    toggleBodySettings();
+
+    // Face
+    const face = config.face || {};
+    document.getElementById('faceEnabled').checked = face.enabled !== false;
+    document.getElementById('faceDetConf').value = face.min_detection_confidence || 0.5;
+    document.getElementById('faceDetConfVal').textContent = (face.min_detection_confidence || 0.5).toFixed(2);
+    document.getElementById('faceTrkConf').value = face.min_tracking_confidence || 0.5;
+    document.getElementById('faceTrkConfVal').textContent = (face.min_tracking_confidence || 0.5).toFixed(2);
+    document.getElementById('faceSmoothing').value = face.smoothing || 'one_euro';
+    document.getElementById('faceMinCutoff').value = face.one_euro_min_cutoff || 1.0;
+    document.getElementById('faceMinCutoffVal').textContent = (face.one_euro_min_cutoff || 1.0).toFixed(1);
+    document.getElementById('faceBeta').value = face.one_euro_beta || 0.007;
+    document.getElementById('faceBetaVal').textContent = (face.one_euro_beta || 0.007).toFixed(3);
+    document.getElementById('faceSmoothFactor').value = face.smoothing_factor || 0.3;
+    document.getElementById('faceSmoothFactorVal').textContent = (face.smoothing_factor || 0.3).toFixed(2);
+    document.getElementById('blendshapeSmoothing').value = face.blendshape_smoothing || 0.4;
+    document.getElementById('blendshapeSmoothingVal').textContent = (face.blendshape_smoothing || 0.4).toFixed(2);
+    document.getElementById('facePresenceConf').value = face.min_face_presence_confidence || 0.5;
+    document.getElementById('facePresenceConfVal').textContent = (face.min_face_presence_confidence || 0.5).toFixed(2);
+    document.getElementById('headRotSmoothing').value = face.head_rotation_smoothing || 0.3;
+    document.getElementById('headRotSmoothingVal').textContent = (face.head_rotation_smoothing || 0.3).toFixed(2);
+    document.getElementById('headPosScale').value = face.head_position_scale || 1.0;
+    document.getElementById('headPosScaleVal').textContent = (face.head_position_scale || 1.0).toFixed(1);
+    const headOffset = face.head_position_offset || [0, 0, 0];
+    document.getElementById('headPosYOffset').value = headOffset[1] || 0;
+    document.getElementById('headPosYOffsetVal').textContent = (headOffset[1] || 0).toFixed(2);
+    toggleFaceSettings();
+
+    // Hand
+    const hand = config.hand || {};
+    document.getElementById('handEnabled').checked = hand.enabled !== false;
+    document.getElementById('handDetConf').value = hand.min_detection_confidence || 0.6;
+    document.getElementById('handDetConfVal').textContent = (hand.min_detection_confidence || 0.6).toFixed(2);
+    document.getElementById('handTrkConf').value = hand.min_tracking_confidence || 0.5;
+    document.getElementById('handTrkConfVal').textContent = (hand.min_tracking_confidence || 0.5).toFixed(2);
+    document.getElementById('handMinCutoff').value = hand.one_euro_min_cutoff || 1.0;
+    document.getElementById('handMinCutoffVal').textContent = (hand.one_euro_min_cutoff || 1.0).toFixed(1);
+    document.getElementById('handBeta').value = hand.one_euro_beta || 0.01;
+    document.getElementById('handBetaVal').textContent = (hand.one_euro_beta || 0.01).toFixed(3);
+    document.getElementById('handMaxNum').value = hand.max_num_hands || 2;
+    document.getElementById('palmBackClassify').checked = hand.palm_back_classify !== false;
+    document.getElementById('backCurlComp').value = hand.back_curl_compensation || 1.25;
+    document.getElementById('backCurlCompVal').textContent = (hand.back_curl_compensation || 1.25).toFixed(2);
+    document.getElementById('backRollComp').value = hand.back_roll_compensation || 0.15;
+    document.getElementById('backRollCompVal').textContent = (hand.back_roll_compensation || 0.15).toFixed(2);
+    toggleHandSettings();
+    togglePalmBackSettings();
+
+    // Processing
+    const proc = config.processing || {};
+    document.getElementById('procSmoothing').value = proc.smoothing || 'one_euro';
+    document.getElementById('procMinCutoff').value = proc.one_euro_min_cutoff || 1.0;
+    document.getElementById('procMinCutoffVal').textContent = (proc.one_euro_min_cutoff || 1.0).toFixed(1);
+    document.getElementById('procBeta').value = proc.one_euro_beta || 0.007;
+    document.getElementById('procBetaVal').textContent = (proc.one_euro_beta || 0.007).toFixed(3);
+
+    // 推流管理 (每个模块独立 OSC 地址)
+    const streaming = config.streaming || {};
+    const vrc = config.vrc || {};
+    const body_cfg = streaming.body || {};
+    const hand_cfg = streaming.hand || {};
+    const face_cfg = streaming.face || {};
+
+    // 身体推流 (独立地址)
+    document.getElementById('bodyHost').value = body_cfg.host || vrc.host || '127.0.0.1';
+    document.getElementById('bodyPort').value = body_cfg.port || vrc.port || 9000;
+    document.getElementById('bodyProtocol').value = body_cfg.protocol || vrc.protocol || 'osc';
+    document.getElementById('bodyStreamingEnabled').checked = body_cfg.streaming_enabled !== false;
+
+    // 面部推流 (独立地址)
+    document.getElementById('faceHost').value = face_cfg.host || vrc.host || '127.0.0.1';
+    document.getElementById('facePort').value = face_cfg.port || vrc.port || 9000;
+    document.getElementById('vmcPort').value = face_cfg.vmc_port || 39539;
+    document.getElementById('faceStreamingEnabled').checked = face_cfg.streaming_enabled !== false;
+
+    // 手部推流 (独立地址 + VMT)
+    document.getElementById('handHost').value = hand_cfg.host || vrc.host || '127.0.0.1';
+    document.getElementById('handPort').value = hand_cfg.port || vrc.port || 9000;
+    document.getElementById('vmtHost').value = hand_cfg.vmt_host || '127.0.0.1';
+    document.getElementById('vmtPort').value = hand_cfg.vmt_port || 39570;
+    document.getElementById('handStreamingEnabled').checked = hand_cfg.streaming_enabled !== false;
+
+    // 追踪器传输开关
+    document.getElementById('sendPosition').checked = body_cfg.send_position !== false;
+    document.getElementById('sendRotation').checked = body_cfg.send_rotation !== false;
+    document.getElementById('sendHeadPosition').checked = (body_cfg.send_head_position || vrc.send_head_position) === true;
+    const toggles = body_cfg.tracker_toggles || vrc.tracker_toggles || {};
+    document.querySelectorAll('.tracker-toggle').forEach(el => {
+      const bone = el.dataset.bone;
+      el.checked = toggles[bone] !== false;
+    });
+
+    // SteamVR (优先从 streaming.body.steamvr 读取)
+    const steamvr = (body_cfg.steamvr || config.steamvr || {});
+    document.getElementById('steamvrSmoothing').value = steamvr.smoothing || 50;
+    document.getElementById('steamvrAdditionalSmoothing').value = steamvr.additional_smoothing || 0.5;
+    document.getElementById('steamvrCameraLatency').value = steamvr.camera_latency || 0;
+    _svTrackers = steamvr.trackers || [
+      {"body_part": "Hips", "role": "TrackerRole_Waist"},
+      {"body_part": "Chest", "role": "TrackerRole_Chest"},
+      {"body_part": "LeftFoot", "role": "TrackerRole_LeftFoot"},
+      {"body_part": "RightFoot", "role": "TrackerRole_RightFoot"},
+      {"body_part": "LeftKnee", "role": "TrackerRole_LeftKnee"},
+      {"body_part": "RightKnee", "role": "TrackerRole_RightKnee"},
+      {"body_part": "LeftElbow", "role": "TrackerRole_LeftElbow"},
+      {"body_part": "RightElbow", "role": "TrackerRole_RightElbow"}
+    ];
+    svRenderTrackers();
+    svCheckStatus();
+    onProtocolChange();
+
+    // HMD
+    const hmd = config.hmd || {};
+    document.getElementById('hmdProvider').value = hmd.provider || 'static';
+    document.getElementById('hmdOscPort').value = hmd.osc_listen_port || 9001;
+    document.getElementById('hmdPicoHost').value = hmd.pico_host || '127.0.0.1';
+    document.getElementById('hmdPicoPort').value = hmd.pico_port || 7890;
+    document.getElementById('hmdPicoXRoboHost').value = hmd.pico_xrobo_host || '0.0.0.0';
+    document.getElementById('hmdPicoXRoboPort').value = hmd.pico_xrobo_port || 39540;
+    document.getElementById('hmdQuestHost').value = hmd.quest_host || '127.0.0.1';
+    document.getElementById('hmdQuestPort').value = hmd.quest_port || 53342;
+    document.getElementById('hmdQuestUDPHost').value = hmd.quest_udp_host || '0.0.0.0';
+    document.getElementById('hmdQuestUDPPort').value = hmd.quest_udp_port || 39541;
+    document.getElementById('hmdRemotePort').value = hmd.remote_port || 4243;
+    onHmdProviderChange();
+    hmdCheckStatus();  // 自动检测 HMD 连接状态
+
+    showToast('配置已加载');
+  } catch (e) {
+    showToast('加载配置失败: ' + e.message, 'error');
+  }
+}
+
+// ============ 保存配置 ============
+
+// 自动保存配置 (防抖, 开关变更时自动触发)
+let _autoSaveTimer = null;
+function autoSaveConfig() {
+  if (_autoSaveTimer) clearTimeout(_autoSaveTimer);
+  _autoSaveTimer = setTimeout(async () => {
+    try {
+      await saveAll();
+    } catch (e) {}
+  }, 500);
+}
+
+async function saveAll() {
+  const config = {
+    camera: {
+      camera_id: parseInt(document.getElementById('cameraId').value) || 0,
+      width: parseInt(document.getElementById('cameraWidth').value) || 1280,
+      height: parseInt(document.getElementById('cameraHeight').value) || 720,
+      fps: parseInt(document.getElementById('cameraFps').value) || 30,
+      flip_horizontal: document.getElementById('cameraFlip').checked,
+    },
+    yolo: {
+      model_path: document.getElementById('modelPath').value,
+      model_type: _selectedModelType || 'nano',
+      device: document.getElementById('device').value,
+      precision: _selectedPrecision || 'fp16',
+      conf_threshold: parseFloat(document.getElementById('confThreshold').value),
+      half: _selectedPrecision === 'fp16',
+    },
+    body: {
+      enabled: document.getElementById('bodyEnabled').checked,
+      detect_torso: document.getElementById('detectTorso').checked,
+      detect_left_arm: document.getElementById('detectLeftArm').checked,
+      detect_right_arm: document.getElementById('detectRightArm').checked,
+      detect_left_leg: document.getElementById('detectLeftLeg').checked,
+      detect_right_leg: document.getElementById('detectRightLeg').checked,
+    },
+    face: {
+      enabled: document.getElementById('faceEnabled').checked,
+      min_detection_confidence: parseFloat(document.getElementById('faceDetConf').value),
+      min_face_presence_confidence: parseFloat(document.getElementById('facePresenceConf').value),
+      min_tracking_confidence: parseFloat(document.getElementById('faceTrkConf').value),
+      smoothing: document.getElementById('faceSmoothing').value,
+      smoothing_factor: parseFloat(document.getElementById('faceSmoothFactor').value),
+      one_euro_min_cutoff: parseFloat(document.getElementById('faceMinCutoff').value),
+      one_euro_beta: parseFloat(document.getElementById('faceBeta').value),
+      blendshape_smoothing: parseFloat(document.getElementById('blendshapeSmoothing').value),
+      head_position_scale: parseFloat(document.getElementById('headPosScale').value),
+      head_position_offset: [0, parseFloat(document.getElementById('headPosYOffset').value), 0],
+      head_rotation_smoothing: parseFloat(document.getElementById('headRotSmoothing').value),
+    },
+    hand: {
+      enabled: document.getElementById('handEnabled').checked,
+      max_num_hands: parseInt(document.getElementById('handMaxNum').value),
+      min_detection_confidence: parseFloat(document.getElementById('handDetConf').value),
+      min_tracking_confidence: parseFloat(document.getElementById('handTrkConf').value),
+      one_euro_min_cutoff: parseFloat(document.getElementById('handMinCutoff').value),
+      one_euro_beta: parseFloat(document.getElementById('handBeta').value),
+      palm_back_classify: document.getElementById('palmBackClassify').checked,
+      back_curl_compensation: parseFloat(document.getElementById('backCurlComp').value),
+      back_roll_compensation: parseFloat(document.getElementById('backRollComp').value),
+    },
+    processing: {
+      smoothing: document.getElementById('procSmoothing').value,
+      smoothing_factor: parseFloat(document.getElementById('faceSmoothFactor').value),
+      one_euro_min_cutoff: parseFloat(document.getElementById('procMinCutoff').value),
+      one_euro_beta: parseFloat(document.getElementById('procBeta').value),
+    },
+    vrc: {
+      host: document.getElementById('bodyHost').value,
+      port: parseInt(document.getElementById('bodyPort').value),
+      protocol: document.getElementById('bodyProtocol').value,
+      tracker_toggles: (() => {
+        const t = {};
+        document.querySelectorAll('.tracker-toggle').forEach(el => {
+          t[el.dataset.bone] = el.checked;
+        });
+        return t;
+      })(),
+      send_position: document.getElementById('sendPosition').checked,
+      send_rotation: document.getElementById('sendRotation').checked,
+      send_head_position: document.getElementById('sendHeadPosition').checked,
+    },
+    streaming: {
+      body: {
+        host: document.getElementById('bodyHost').value,
+        port: parseInt(document.getElementById('bodyPort').value),
+        protocol: document.getElementById('bodyProtocol').value,
+        streaming_enabled: document.getElementById('bodyStreamingEnabled').checked,
+        tracker_toggles: (() => {
+          const t = {};
+          document.querySelectorAll('.tracker-toggle').forEach(el => {
+            t[el.dataset.bone] = el.checked;
+          });
+          return t;
+        })(),
+        send_position: document.getElementById('sendPosition').checked,
+        send_rotation: document.getElementById('sendRotation').checked,
+        send_head_position: document.getElementById('sendHeadPosition').checked,
+        steamvr: {
+          smoothing: parseInt(document.getElementById('steamvrSmoothing').value),
+          additional_smoothing: parseFloat(document.getElementById('steamvrAdditionalSmoothing').value),
+          camera_latency: parseFloat(document.getElementById('steamvrCameraLatency').value),
+          hmd_to_neck_offset: [0, -0.2, 0.1],
+          trackers: _svTrackers,
+        },
+      },
+      face: {
+        host: document.getElementById('faceHost').value,
+        port: parseInt(document.getElementById('facePort').value),
+        streaming_enabled: document.getElementById('faceStreamingEnabled').checked,
+        vmc_port: parseInt(document.getElementById('vmcPort').value),
+      },
+      hand: {
+        host: document.getElementById('handHost').value,
+        port: parseInt(document.getElementById('handPort').value),
+        streaming_enabled: document.getElementById('handStreamingEnabled').checked,
+        vmt_host: document.getElementById('vmtHost').value,
+        vmt_port: parseInt(document.getElementById('vmtPort').value),
+      },
+    },
+    steamvr: {
+      smoothing: parseInt(document.getElementById('steamvrSmoothing').value),
+      additional_smoothing: parseFloat(document.getElementById('steamvrAdditionalSmoothing').value),
+      camera_latency: parseFloat(document.getElementById('steamvrCameraLatency').value),
+      hmd_to_neck_offset: [0, -0.2, 0.1],
+      trackers: _svTrackers,
+    },
+    hmd: {
+      provider: document.getElementById('hmdProvider').value,
+      osc_listen_port: parseInt(document.getElementById('hmdOscPort').value),
+      pico_host: document.getElementById('hmdPicoHost').value,
+      pico_port: parseInt(document.getElementById('hmdPicoPort').value),
+      pico_xrobo_host: document.getElementById('hmdPicoXRoboHost').value,
+      pico_xrobo_port: parseInt(document.getElementById('hmdPicoXRoboPort').value),
+      quest_host: document.getElementById('hmdQuestHost').value,
+      quest_port: parseInt(document.getElementById('hmdQuestPort').value),
+      quest_udp_host: document.getElementById('hmdQuestUDPHost').value,
+      quest_udp_port: parseInt(document.getElementById('hmdQuestUDPPort').value),
+      remote_port: parseInt(document.getElementById('hmdRemotePort').value),
+    },
+  };
+
+  try {
+    await api('/api/config', 'POST', config);
+    showToast('配置已保存');
+  } catch (e) {
+    showToast('保存失败: ' + e.message, 'error');
+  }
+}
+
+// ============ 动捕控制 ============
+
+async function startMocap() {
+  try {
+    // 先保存配置，不阻塞启动
+    saveAll().catch(() => {});
+    const res = await api('/api/mocap/start', 'POST', {
+      device: document.getElementById('device').value,
+      model: document.getElementById('modelPath').value,
+      precision: _selectedPrecision || 'fp16',
+      protocol: document.getElementById('bodyProtocol').value,
+      camera: parseInt(document.getElementById('cameraId').value) || 0,
+    });
+    if (res.status === 'ok') {
+      showToast('动捕已启动 (PID: ' + res.pid + ')');
+      updateStatus();
+    } else {
+      showToast(res.message || '启动失败', 'error');
+    }
+  } catch (e) {
+    showToast('启动失败: ' + e.message, 'error');
+  }
+}
+
+async function stopMocap() {
+  try {
+    const statusRes = await api('/api/mocap/status');
+    if (statusRes.running && !statusRes.managed && statusRes.external_procs && statusRes.external_procs.length > 0) {
+      const extPids = statusRes.external_procs.map(p => p.pid).join(', ');
+      if (!confirm('检测到外部启动的动捕进程 (PID: ' + extPids + ')，是否终止？')) {
+        return;
+      }
+    }
+    await api('/api/mocap/stop', 'POST');
+    showToast('动捕已停止');
+    updateStatus();
+  } catch (e) {
+    showToast('停止失败: ' + e.message, 'error');
+  }
+}
+
+async function updateStatus() {
+  try {
+    const res = await api('/api/mocap/status');
+    const badge = document.getElementById('statusBadge');
+    const fab = document.getElementById('fabPower');
+    const staleInfo = document.getElementById('staleProcessInfo');
+
+    if (res.running) {
+      if (res.managed) {
+        badge.textContent = 'RUNNING (PID: ' + res.pid + ')';
+        badge.className = 'status-badge status-running';
+      } else {
+        const extPid = res.external_pid || (res.external_procs && res.external_procs[0] ? res.external_procs[0].pid : '?');
+        badge.textContent = 'RUNNING (外部 PID: ' + extPid + ')';
+        badge.className = 'status-badge status-warning';
+      }
+      fab.className = 'fab-power on';
+      fab.title = '点击停止动捕';
+    } else {
+      badge.textContent = 'STOPPED';
+      badge.className = 'status-badge status-stopped';
+      fab.className = 'fab-power off';
+      fab.title = '点击启动动捕';
+    }
+
+    // 残留进程检测 (仅当 Dashboard 管理的进程运行时有外部进程)
+    const stalePids = res.stale_pids || [];
+    if (staleInfo) {
+      if (stalePids.length > 0) {
+        staleInfo.style.display = 'flex';
+        staleInfo.innerHTML = '<span style="color:#f39c12; font-size:12px;">检测到残留进程 (PID: ' + stalePids.join(', ') + ')</span>' +
+          '<button class="btn btn-outline" onclick="killStaleProcesses()" style="font-size:11px; padding:2px 10px; margin-left:8px;">清理</button>';
+        if (!res.running) {
+          badge.textContent = 'STOPPED (有残留进程)';
+          badge.className = 'status-badge status-warning';
+        }
+      } else {
+        staleInfo.style.display = 'none';
+      }
+    }
+  } catch (e) {}
+}
+
+async function killStaleProcesses() {
+  try {
+    const res = await api('/api/mocap/kill_stale', 'POST');
+    if (res.killed > 0) {
+      showToast('已终止 ' + res.killed + ' 个残留进程');
+    } else {
+      showToast('未发现残留进程');
+    }
+    updateStatus();
+  } catch (e) {
+    showToast('清理失败: ' + e.message, 'error');
+  }
+}
+
+// ===== 日志面板 =====
+let _logAutoRefreshTimer = null;
+
+async function refreshLog() {
+  try {
+    const res = await api('/api/mocap/log?tail=50');
+    const el = document.getElementById('logContent');
+    if (!res.exists) {
+      el.textContent = '暂无日志（动捕未启动过）';
+      return;
+    }
+    // 高亮关键信息
+    let logText = res.log || '(空)';
+    // 简单高亮: 错误红色, 警告黄色, 状态绿色
+    logText = logText
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/(ERROR|Error|error|失败|崩溃|Exception|Traceback)/g, '<span style="color:#e74c3c;font-weight:600;">$1</span>')
+      .replace(/(WARNING|Warning|warn|警告)/g, '<span style="color:#f39c12;">$1</span>')
+      .replace(/(\[Status\]|\[HotReload\]|OK|成功|started|connected|loaded)/g, '<span style="color:#00b894;">$1</span>')
+      .replace(/(OFF|已停止)/g, '<span style="color:#636e72;">$1</span>');
+    el.innerHTML = logText;
+    // 自动滚动到底部
+    el.scrollTop = el.scrollHeight;
+  } catch (e) {}
+}
+
+function startLogAutoRefresh() {
+  if (_logAutoRefreshTimer) clearInterval(_logAutoRefreshTimer);
+  _logAutoRefreshTimer = setInterval(() => {
+    if (document.getElementById('logAutoRefresh').checked) {
+      refreshLog();
+    }
+  }, 2000);
+}
+
+// ===== 推理状态指示器 =====
+async function updateInferenceStatus() {
+  try {
+    const res = await api('/api/mocap/inference_status');
+    if (!res.available) return;
+
+    const modules = [
+      { id: 'bodyInferenceStatus', status: res.body, toggleId: 'bodyEnabled' },
+      { id: 'faceInferenceStatus', status: res.face, toggleId: 'faceEnabled' },
+      { id: 'handInferenceStatus', status: res.hand, toggleId: 'handEnabled' },
+    ];
+
+    modules.forEach(m => {
+      const el = document.getElementById(m.id);
+      if (!el) return;
+      if (m.status === null || m.status === undefined) {
+        el.style.display = 'none';
+        return;
+      }
+      el.style.display = 'inline-block';
+      const toggleEl = document.getElementById(m.toggleId);
+      const toggleChecked = toggleEl ? toggleEl.checked : true;
+
+      if (m.status) {
+        el.textContent = '推理中';
+        el.style.background = '#00b894';
+        el.style.color = '#fff';
+      } else {
+        el.textContent = '已停止';
+        el.style.background = '#636e72';
+        el.style.color = '#fff';
+      }
+
+      // 开关与后端状态不一致时警告
+      if (toggleChecked !== m.status) {
+        el.textContent = toggleChecked ? '切换中...' : '已停止';
+        el.style.background = toggleChecked ? '#f39c12' : '#636e72';
+      }
+    });
+  } catch (e) {}
+}
+
+async function togglePower() {
+  const fab = document.getElementById('fabPower');
+  if (fab.classList.contains('on')) {
+    await stopMocap();
+  } else {
+    await startMocap();
+  }
+}
+
+function onProtocolChange() {
+  const protocol = document.getElementById('bodyProtocol').value;
+  const steamvrParams = document.getElementById('steamvrParams');
+  const oscParams = document.getElementById('oscParams');
+  const steamvrCard = document.getElementById('steamvrCard');
+  const bodyHostInput = document.getElementById('bodyHost');
+  const bodyPortInput = document.getElementById('bodyPort');
+
+  if (protocol === 'steamvr') {
+    steamvrParams.style.display = 'block';
+    oscParams.style.display = 'none';
+    if (steamvrCard) steamvrCard.style.display = 'block';
+    bodyHostInput.disabled = true;
+    bodyPortInput.disabled = true;
+    bodyHostInput.value = 'pipe';
+    bodyPortInput.value = 0;
+  } else {
+    steamvrParams.style.display = 'none';
+    oscParams.style.display = 'block';
+    if (steamvrCard) steamvrCard.style.display = 'none';
+    bodyHostInput.disabled = false;
+    bodyPortInput.disabled = false;
+    if (bodyHostInput.value === 'pipe') bodyHostInput.value = '127.0.0.1';
+    if (bodyPortInput.value === '0') bodyPortInput.value = 9000;
+  }
+}
+
+// ===== HMD 位姿配置 =====
+let _hmdPollTimer = null;
+
+function onHmdProviderChange() {
+  const provider = document.getElementById('hmdProvider').value;
+  document.getElementById('hmdOscParams').style.display = provider === 'vrchat_osc' ? 'block' : 'none';
+  document.getElementById('hmdPicoParams').style.display = provider === 'pico' ? 'block' : 'none';
+  document.getElementById('hmdPicoXRoboParams').style.display = provider === 'pico_xrobo' ? 'block' : 'none';
+  document.getElementById('hmdQuestParams').style.display = provider === 'quest' ? 'block' : 'none';
+  document.getElementById('hmdQuestUDPParams').style.display = provider === 'quest_udp' ? 'block' : 'none';
+  document.getElementById('hmdRemoteParams').style.display = provider === 'remote' ? 'block' : 'none';
+
+  // 若 HMD 已启用，切换 provider 时自动重启
+  if (document.getElementById('hmdEnable').checked && provider !== 'static') {
+    onHmdToggle(); // 先停止
+    setTimeout(() => {
+      document.getElementById('hmdEnable').checked = true;
+      onHmdToggle(); // 再启动
+    }, 200);
+  }
+}
+
+async function onHmdToggle() {
+  const enabled = document.getElementById('hmdEnable').checked;
+  const provider = document.getElementById('hmdProvider');
+  provider.disabled = !enabled;
+
+  if (enabled) {
+    // 启动 HMD 提供者
+    const type = provider.value;
+    if (type === 'static') {
+      document.getElementById('hmdEnable').checked = false;
+      provider.disabled = true;
+      showToast('当前为 static 模式，无需启用', 'warning');
+      return;
+    }
+    try {
+      const res = await api('/api/hmd/start', 'POST', {
+        provider: type,
+        osc_listen_port: parseInt(document.getElementById('hmdOscPort').value),
+        pico_host: document.getElementById('hmdPicoHost').value,
+        pico_port: parseInt(document.getElementById('hmdPicoPort').value),
+        pico_xrobo_host: document.getElementById('hmdPicoXRoboHost').value,
+        pico_xrobo_port: parseInt(document.getElementById('hmdPicoXRoboPort').value),
+        quest_host: document.getElementById('hmdQuestHost').value,
+        quest_port: parseInt(document.getElementById('hmdQuestPort').value),
+        quest_udp_host: document.getElementById('hmdQuestUDPHost').value,
+        quest_udp_port: parseInt(document.getElementById('hmdQuestUDPPort').value),
+        remote_port: parseInt(document.getElementById('hmdRemotePort').value),
+      });
+      if (res.status === 'ok') {
+        showToast(res.message);
+        startHmdPoll();
+      } else {
+        showToast(res.message, 'error');
+        document.getElementById('hmdEnable').checked = false;
+        provider.disabled = true;
+      }
+    } catch (e) {
+      showToast('HMD 启动失败: ' + e.message, 'error');
+      document.getElementById('hmdEnable').checked = false;
+      provider.disabled = true;
+    }
+  } else {
+    // 停止 HMD 提供者
+    try {
+      await api('/api/hmd/stop', 'POST');
+      stopHmdPoll();
+      document.getElementById('hmdStatus').innerHTML = '<span style="color:var(--text-dim)">已停止</span>';
+      document.getElementById('hmdPoseDisplay').style.display = 'none';
+    } catch (e) {
+      showToast('HMD 停止失败: ' + e.message, 'error');
+    }
+  }
+}
+
+async function hmdCheckStatus() {
+  try {
+    const res = await api('/api/hmd/status', 'GET');
+    const enableEl = document.getElementById('hmdEnable');
+    const providerEl = document.getElementById('hmdProvider');
+
+    if (res.running) {
+      enableEl.checked = true;
+      providerEl.disabled = false;
+      // 同步 provider 下拉框为实际运行的 provider
+      if (res.provider && res.provider !== 'static') {
+        providerEl.value = res.provider;
+        onHmdProviderChange();
+      }
+      updateHmdDisplay(res);
+      startHmdPoll();
+    } else {
+      enableEl.checked = false;
+      providerEl.disabled = true;
+      document.getElementById('hmdStatus').innerHTML = '<span style="color:var(--text-dim)">未连接</span>';
+      document.getElementById('hmdPoseDisplay').style.display = 'none';
+      stopHmdPoll();
+    }
+  } catch (e) {
+    document.getElementById('hmdStatus').innerHTML = '<span style="color:var(--danger)">检测失败</span>';
+  }
+}
+
+function updateHmdDisplay(data) {
+  const statusEl = document.getElementById('hmdStatus');
+  const poseDisplay = document.getElementById('hmdPoseDisplay');
+
+  if (data.running) {
+    const providerNames = {
+      'remote': '远程UDP', 'openvr': 'SteamVR', 'vrchat_osc': 'VRChat OSC',
+      'pico_streaming': 'Pico串流', 'pico_xrobo': 'Pico XR-Robotics',
+      'quest_link': 'Quest Link', 'quest_udp': 'Quest UDP',
+      'dashboard_api': 'Dashboard API', 'static': '静态'
+    };
+    const pName = providerNames[data.provider] || data.provider;
+    statusEl.innerHTML = `<span style="color:#4caf50">运行中 (${pName})</span>`;
+    if (data.pose) {
+      poseDisplay.style.display = 'block';
+      const p = data.pose.position;
+      const r = data.pose.rotation;
+      document.getElementById('hmdPosePos').textContent =
+        `X: ${p[0].toFixed(3)}  Y: ${p[1].toFixed(3)}  Z: ${p[2].toFixed(3)}`;
+      document.getElementById('hmdPoseRot').textContent =
+        `P: ${r[0].toFixed(1)}  Y: ${r[1].toFixed(1)}  R: ${r[2].toFixed(1)}`;
+      document.getElementById('hmdPoseValid').innerHTML = data.pose.valid
+        ? '<span style="color:#4caf50">有效</span>'
+        : '<span style="color:var(--danger)">无效</span>';
+      document.getElementById('hmdProviderName').textContent = pName;
+    }
+  } else {
+    statusEl.innerHTML = '<span style="color:var(--text-dim)">未连接</span>';
+    poseDisplay.style.display = 'none';
+  }
+}
+
+function startHmdPoll() {
+  stopHmdPoll();
+  _hmdPollTimer = setInterval(async () => {
+    try {
+      const res = await api('/api/hmd/status', 'GET');
+      updateHmdDisplay(res);
+    } catch (e) { /* ignore */ }
+  }, 500);
+}
+
+function stopHmdPoll() {
+  if (_hmdPollTimer) {
+    clearInterval(_hmdPollTimer);
+    _hmdPollTimer = null;
+  }
+}
+
+// ===== SteamVR 追踪器管理 =====
+let _svTrackers = [
+  {"body_part": "Hips", "role": "TrackerRole_Waist"},
+  {"body_part": "Chest", "role": "TrackerRole_Chest"},
+  {"body_part": "LeftFoot", "role": "TrackerRole_LeftFoot"},
+  {"body_part": "RightFoot", "role": "TrackerRole_RightFoot"},
+  {"body_part": "LeftKnee", "role": "TrackerRole_LeftKnee"},
+  {"body_part": "RightKnee", "role": "TrackerRole_RightKnee"},
+  {"body_part": "LeftElbow", "role": "TrackerRole_LeftElbow"},
+  {"body_part": "RightElbow", "role": "TrackerRole_RightElbow"}
+];
+
+const _svBodyParts = [
+  ["Hips","腰部"], ["Chest","胸部"], ["LeftFoot","左脚"], ["RightFoot","右脚"],
+  ["LeftKnee","左膝"], ["RightKnee","右膝"], ["LeftHand","左手"], ["RightHand","右手"],
+  ["LeftElbow","左肘"], ["RightElbow","右肘"], ["Head","头部"]
+];
+
+const _svRoles = [
+  ["TrackerRole_Waist","腰部"], ["TrackerRole_Chest","胸部"],
+  ["TrackerRole_LeftFoot","左脚"], ["TrackerRole_RightFoot","右脚"],
+  ["TrackerRole_LeftKnee","左膝"], ["TrackerRole_RightKnee","右膝"],
+  ["TrackerRole_Handed","手部"], ["TrackerRole_LeftElbow","左肘"],
+  ["TrackerRole_RightElbow","右肘"], ["TrackerRole_Shoulder","肩膀"],
+  ["TrackerRole_Head","头部"]
+];
+
+function svRenderTrackers() {
+  const box = document.getElementById('svTrackerRows');
+  if (!box) return;
+  box.innerHTML = '';
+  _svTrackers.forEach((t, i) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:6px; align-items:center;';
+
+    const num = document.createElement('span');
+    num.style.cssText = 'font-size:12px; color:var(--text-dim); min-width:20px; text-align:center;';
+    num.textContent = '#' + (i + 1);
+    row.appendChild(num);
+
+    const lbl1 = document.createElement('span');
+    lbl1.style.cssText = 'font-size:11px; color:var(--text-dim); min-width:28px;';
+    lbl1.textContent = '部位';
+    row.appendChild(lbl1);
+
+    const sel1 = document.createElement('select');
+    sel1.style.cssText = 'flex:1; font-size:12px; padding:4px 6px;';
+    _svBodyParts.forEach(([val, lbl]) => {
+      const o = document.createElement('option');
+      o.value = val; o.textContent = lbl;
+      if (t.body_part === val) o.selected = true;
+      sel1.appendChild(o);
+    });
+    sel1.onchange = () => { _svTrackers[i].body_part = sel1.value; };
+    row.appendChild(sel1);
+
+    const lbl2 = document.createElement('span');
+    lbl2.style.cssText = 'font-size:11px; color:var(--text-dim); min-width:28px;';
+    lbl2.textContent = '角色';
+    row.appendChild(lbl2);
+
+    const sel2 = document.createElement('select');
+    sel2.style.cssText = 'flex:1; font-size:12px; padding:4px 6px;';
+    _svRoles.forEach(([val, lbl]) => {
+      const o = document.createElement('option');
+      o.value = val; o.textContent = lbl;
+      if (t.role === val) o.selected = true;
+      sel2.appendChild(o);
+    });
+    sel2.onchange = () => { _svTrackers[i].role = sel2.value; };
+    row.appendChild(sel2);
+
+    box.appendChild(row);
+  });
+  document.getElementById('svTrackerCount').value = _svTrackers.length;
+}
+
+function svUpdateTrackerCount() {
+  let n = parseInt(document.getElementById('svTrackerCount').value) || 3;
+  n = Math.max(1, Math.min(11, n));
+  document.getElementById('svTrackerCount').value = n;
+  while (_svTrackers.length < n) {
+    _svTrackers.push({"body_part": "Hips", "role": "TrackerRole_Waist"});
+  }
+  while (_svTrackers.length > n) {
+    _svTrackers.pop();
+  }
+  svRenderTrackers();
+}
+
+// ===== SteamVR 驱动安装 =====
+async function svCheckStatus() {
+  const st = document.getElementById('svDriverSt');
+  const btn = document.getElementById('svInstallBtn');
+  const vrpathBtn = document.getElementById('svInstallVrpathBtn');
+  const uninstallBtn = document.getElementById('svUninstallBtn');
+  if (!st) return;
+  try {
+    const r = await api('/api/steamvr/status', 'GET');
+    const tags = [];
+    tags.push(r.driver_files_available ? '<span style="color:#4caf50">文件✓</span>' : '<span style="color:var(--danger)">文件✗</span>');
+    tags.push(r.driver_installed_to_steamvr ? '<span style="color:#4caf50">已安装✓</span>' : '<span style="color:var(--danger)">未安装</span>');
+    tags.push(r.activate_multiple_drivers ? '<span style="color:#4caf50">多驱动✓</span>' : '<span style="color:var(--danger)">多驱动✗</span>');
+    tags.push(r.steamvr_running ? `<span style="color:#4caf50">运行中(${r.num_trackers_registered}个)</span>` : '<span style="color:var(--text-dim)">未运行</span>');
+    st.innerHTML = tags.join(' ');
+    const installed = r.driver_installed_to_steamvr;
+    btn.style.display = installed ? 'none' : 'inline-block';
+    uninstallBtn.style.display = installed ? 'inline-block' : 'none';
+    vrpathBtn.style.display = installed ? 'none' : 'inline-block';
+  } catch (e) {
+    st.innerHTML = '<span style="color:var(--danger)">检测失败</span>';
+    btn.style.display = 'inline-block';
+  }
+}
+
+async function svInstallDriver() {
+  const btn = document.getElementById('svInstallBtn');
+  btn.disabled = true;
+  btn.textContent = '安装中...';
+  try {
+    const r = await api('/api/steamvr/install', 'POST');
+    if (r.status === 'ok') showToast(r.message);
+    else if (r.status === 'warning') showToast(r.message, 'warning');
+    else showToast(r.message, 'error');
+  } catch (e) {
+    showToast('安装失败: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = '安装驱动';
+  svCheckStatus();
+}
+
+async function svInstallVrpath() {
+  const btn = document.getElementById('svInstallVrpathBtn');
+  btn.disabled = true;
+  btn.textContent = '注册中...';
+  try {
+    const r = await api('/api/steamvr/install_vrpath', 'POST');
+    if (r.status === 'ok') showToast(r.message);
+    else showToast(r.message, 'error');
+  } catch (e) {
+    showToast('注册失败: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = '注册路径';
+  svCheckStatus();
+}
+
+async function svUninstallDriver() {
+  if (!confirm('确定要卸载 SteamVR 驱动吗？卸载后需重启 SteamVR。')) return;
+  const btn = document.getElementById('svUninstallBtn');
+  btn.disabled = true;
+  btn.textContent = '卸载中...';
+  try {
+    const r = await api('/api/steamvr/uninstall', 'POST');
+    if (r.status === 'ok') showToast(r.message);
+    else showToast(r.message, 'error');
+  } catch (e) {
+    showToast('卸载失败: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = '卸载驱动';
+  svCheckStatus();
+}
+
+function toggleFaceSettings() {
+  const enabled = document.getElementById('faceEnabled').checked;
+  document.getElementById('faceSettings').style.opacity = enabled ? '1' : '0.4';
+  document.getElementById('faceSettings').style.pointerEvents = enabled ? 'auto' : 'none';
+  // 推理关闭时，自动关闭推流
+  if (!enabled) {
+    document.getElementById('faceStreamingEnabled').checked = false;
+  }
+}
+
+// 身体部位开关 -> tracker_toggles 骨骼映射
+const _BODY_PART_TRACKER_MAP = {
+  detectTorso:    ['Hips', 'Chest'],
+  detectLeftArm:  ['LeftLowerArm'],
+  detectRightArm: ['RightLowerArm'],
+  detectLeftLeg:  ['LeftFoot', 'LeftLowerLeg'],
+  detectRightLeg: ['RightFoot', 'RightLowerLeg'],
+};
+
+// tracker_toggles 骨骼 -> 身体部位开关 反向映射
+const _TRACKER_TO_BODY_PART = {};
+Object.entries(_BODY_PART_TRACKER_MAP).forEach(([part, bones]) => {
+  bones.forEach(bone => { _TRACKER_TO_BODY_PART[bone] = part; });
+});
+
+function toggleBodySettings() {
+  const enabled = document.getElementById('bodyEnabled').checked;
+  document.getElementById('bodySettings').style.opacity = enabled ? '1' : '0.4';
+  document.getElementById('bodySettings').style.pointerEvents = enabled ? 'auto' : 'none';
+
+  const pipelineIcon = document.getElementById('pipelineIcon');
+  const pipelineName = document.getElementById('pipelineName');
+  const pipelineDesc = document.getElementById('pipelineDesc');
+
+  if (enabled) {
+    pipelineIcon.textContent = '1';
+    pipelineIcon.style.background = 'var(--accent)';
+    pipelineName.textContent = 'Pipeline 1: 完整检测';
+    pipelineDesc.textContent = 'YOLO26n + MediaPipe (身体+面部+手部)';
+  } else {
+    pipelineIcon.textContent = '2';
+    pipelineIcon.style.background = 'var(--success)';
+    pipelineName.textContent = 'Pipeline 2: 轻量检测';
+    pipelineDesc.textContent = '仅 MediaPipe (面部+手部)，跳过 YOLO，低延迟低占用';
+  }
+
+  if (!enabled) {
+    document.getElementById('bodyStreamingEnabled').checked = false;
+  } else {
+    document.getElementById('bodyStreamingEnabled').checked = true;
+  }
+}
+
+// 身体部位开关变更 -> 同步 tracker_toggles (单向: 推理关闭 -> 推流关闭)
+function syncBodyDetectToTrackers(changedId) {
+  const bones = _BODY_PART_TRACKER_MAP[changedId];
+  if (!bones) return;
+  const checked = document.getElementById(changedId).checked;
+  if (!checked) {
+    // 推理关闭时，自动关闭对应推流 (推理都没有，推流无意义)
+    bones.forEach(bone => {
+      const el = document.querySelector(`.tracker-toggle[data-bone="${bone}"]`);
+      if (el) el.checked = false;
+    });
+  }
+  // 推理开启时，不自动开启推流 (用户可能只想推理不想推流)
+}
+
+// tracker_toggles 变更 -> 不再反向影响推理开关 (推流和推理独立)
+function syncTrackerToBodyDetect(changedBone) {
+  // 推流开关独立于推理开关，不再同步
+  // 用户可以推理某部位但选择不推流
+}
+
+function toggleHandSettings() {
+  const enabled = document.getElementById('handEnabled').checked;
+  document.getElementById('handSettings').style.opacity = enabled ? '1' : '0.4';
+  document.getElementById('handSettings').style.pointerEvents = enabled ? 'auto' : 'none';
+  // 推理关闭时，自动关闭推流
+  if (!enabled) {
+    document.getElementById('handStreamingEnabled').checked = false;
+  }
+  togglePalmBackSettings();
+}
+
+function togglePalmBackSettings() {
+  const classify = document.getElementById('palmBackClassify').checked;
+  const el = document.getElementById('palmBackSettings');
+  if (el) {
+    el.style.opacity = classify ? '1' : '0.4';
+    el.style.pointerEvents = classify ? 'auto' : 'none';
+  }
+}
+
+// ============ 数据集管理 ============
+
+async function loadDatasets() {
+  try {
+    const res = await api('/api/datasets');
+    const list = document.getElementById('datasetList');
+    const select = document.getElementById('trainDataset');
+
+    if (!res.datasets || res.datasets.length === 0) {
+      list.innerHTML = '<div style="color:var(--text-dim); font-size:13px;">暂无数据集，请导入或创建</div>';
+      select.innerHTML = '<option value="">-- 请先导入数据集 --</option>';
+      return;
+    }
+
+    // 渲染列表
+    list.innerHTML = res.datasets.map(d => {
+      const statusColor = d.valid ? 'var(--success)' : 'var(--warning)';
+      const statusText = d.valid ? '有效' : '不完整';
+      return `<div style="display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--border);">
+        <span style="width:8px;height:8px;border-radius:50%;background:${statusColor};flex-shrink:0;"></span>
+        <div style="flex:1; min-width:0;">
+          <div style="font-size:13px; font-weight:600;">${d.name}</div>
+          <div style="font-size:11px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+            train: ${d.train_images}img/${d.train_labels}lbl | val: ${d.val_images}img/${d.val_labels}lbl | ${statusText}
+          </div>
+        </div>
+        <button class="btn btn-outline" style="padding:4px 10px; font-size:11px;" onclick="validateDataset('${d.name}')">验证</button>
+        <button class="btn btn-outline" style="padding:4px 10px; font-size:11px; color:var(--danger);" onclick="deleteDataset('${d.name}')">删除</button>
+      </div>`;
+    }).join('');
+
+    // 更新训练数据集选择
+    select.innerHTML = '<option value="">-- 请选择数据集 --</option>' +
+      res.datasets.filter(d => d.valid).map(d =>
+        `<option value="${d.name}">${d.name} (${d.train_images}img)</option>`
+      ).join('');
+
+  } catch (e) {
+    document.getElementById('datasetList').innerHTML =
+      '<div style="color:var(--danger); font-size:13px;">加载失败</div>';
+  }
+}
+
+async function importDataset(link) {
+  const path = document.getElementById('importPath').value.trim();
+  const name = document.getElementById('importName').value.trim();
+  if (!path) { showToast('请输入数据集路径', 'error'); return; }
+
+  try {
+    const res = await api('/api/datasets/import', 'POST', {
+      source_path: path, name: name, link: link
+    });
+    if (res.status === 'ok') {
+      showToast(res.message);
+      document.getElementById('importPath').value = '';
+      document.getElementById('importName').value = '';
+      loadDatasets();
+    } else {
+      showToast(res.message || '导入失败', 'error');
+    }
+  } catch (e) {
+    showToast('导入失败: ' + e.message, 'error');
+  }
+}
+
+async function createDataset() {
+  const name = document.getElementById('createName').value.trim();
+  if (!name) { showToast('请输入数据集名称', 'error'); return; }
+
+  try {
+    const res = await api('/api/datasets/create', 'POST', { name: name });
+    if (res.status === 'ok') {
+      showToast(res.message);
+      document.getElementById('createName').value = '';
+      loadDatasets();
+    } else {
+      showToast(res.message || '创建失败', 'error');
+    }
+  } catch (e) {
+    showToast('创建失败: ' + e.message, 'error');
+  }
+}
+
+async function validateDataset(name) {
+  try {
+    const res = await api('/api/datasets/' + name + '/validate');
+    if (res.valid) {
+      showToast('数据集验证通过', 'success');
+    } else {
+      const msgs = [...(res.errors || []), ...(res.warnings || [])].join('; ');
+      showToast('验证问题: ' + msgs, 'error');
+    }
+  } catch (e) {
+    showToast('验证失败', 'error');
+  }
+}
+
+async function deleteDataset(name) {
+  if (!confirm('确定删除数据集 "' + name + '"？此操作不可恢复。')) return;
+  try {
+    const res = await api('/api/datasets/' + name, 'DELETE');
+    if (res.status === 'ok') {
+      showToast(res.message);
+      loadDatasets();
+    } else {
+      showToast(res.message || '删除失败', 'error');
+    }
+  } catch (e) {
+    showToast('删除失败', 'error');
+  }
+}
+
+// ============ 模型精度选择 ============
+
+let _selectedModelType = 'nano';
+let _selectedPrecision = 'fp16';
+const _presetDescriptions = {
+  nano: 'Nano: 最小模型，最快推理速度，适合边缘设备',
+  small: 'Small: 小模型，速度与精度均衡，适合大多数场景',
+  medium: 'Medium: 中等模型，高精度，适合服务器部署',
+  large: 'Large: 大模型，最高精度，需要强力GPU',
+};
+const _presetDefaults = {
+  nano: { batch: 32, imgsz: 640, lr0: 0.01 },
+  small: { batch: 24, imgsz: 640, lr0: 0.01 },
+  medium: { batch: 16, imgsz: 640, lr0: 0.008 },
+  large: { batch: 8, imgsz: 640, lr0: 0.006 },
+};
+const _inferenceModelMap = {
+  nano: { path: 'yolo26n-pose.pt', desc: 'Nano (yolo26n-pose.pt) - 极速推理' },
+  small: { path: 'yolo26s-pose.pt', desc: 'Small (yolo26s-pose.pt) - 均衡推理' },
+  medium: { path: 'yolo26m-pose.pt', desc: 'Medium (yolo26m-pose.pt) - 高精度推理' },
+  large: { path: 'yolo26l-pose.pt', desc: 'Large (yolo26l-pose.pt) - 最高精度推理' },
+};
+const _precisionDescriptions = {
+  fp32: 'FP32: 全精度浮点，最高精度，推理速度最慢，适合CPU或精度敏感场景',
+  fp16: 'FP16: 半精度浮点，GPU推理速度提升约2倍，精度损失极小 (推荐)',
+  int8: 'INT8: 8位整数量化，最快推理速度，精度损失较小，适合边缘部署',
+};
+
+function selectPrecision(precision) {
+  _selectedPrecision = precision;
+  document.querySelectorAll('.precision-btn').forEach(btn => {
+    if (btn.dataset.precision === precision) {
+      btn.className = 'btn btn-primary precision-btn';
+    } else {
+      btn.className = 'btn btn-outline precision-btn';
+    }
+  });
+  document.getElementById('precisionDesc').textContent = _precisionDescriptions[precision] || '';
+}
+
+function switchInferenceModel(type) {
+  const descEl = document.getElementById('inferenceModelDesc');
+  const pathInput = document.getElementById('modelPath');
+
+  if (type === 'custom') {
+    pathInput.value = '';
+    pathInput.focus();
+    descEl.textContent = '自定义: 请在上方输入模型路径';
+    return;
+  }
+
+  const info = _inferenceModelMap[type];
+  if (info) {
+    pathInput.value = info.path;
+    descEl.textContent = '当前: ' + info.desc;
+    showToast('已切换到 ' + info.desc.split(' - ')[1]);
+  }
+}
+
+function selectModelPreset(type) {
+  _selectedModelType = type;
+
+  // 更新卡片选中状态
+  document.querySelectorAll('.preset-card').forEach(card => {
+    const cardType = card.getAttribute('data-type');
+    if (cardType === type) {
+      card.style.borderColor = 'var(--accent)';
+      card.querySelector('div').style.color = 'var(--accent)';
+    } else {
+      card.style.borderColor = 'var(--border)';
+      card.querySelector('div').style.color = '';
+    }
+  });
+
+  // 更新描述
+  document.getElementById('presetDesc').textContent = _presetDescriptions[type] || '';
+
+  // 自动调整推荐参数
+  const defaults = _presetDefaults[type];
+  if (defaults) {
+    document.getElementById('trainBatch').value = defaults.batch;
+    document.getElementById('trainImgsz').value = defaults.imgsz;
+    document.getElementById('trainLr0').value = defaults.lr0;
+  }
+}
+
+// ============ 训练管理 ============
+
+async function startTraining() {
+  const dataset = document.getElementById('trainDataset').value;
+  if (!dataset) { showToast('请选择数据集', 'error'); return; }
+
+  try {
+    const res = await api('/api/train/start', 'POST', {
+      dataset: dataset,
+      epochs: parseInt(document.getElementById('trainEpochs').value),
+      batch: parseInt(document.getElementById('trainBatch').value),
+      imgsz: parseInt(document.getElementById('trainImgsz').value),
+      device: document.getElementById('trainDevice').value,
+      freeze: parseInt(document.getElementById('trainFreeze').value),
+      name: document.getElementById('trainName').value.trim() || undefined,
+      hand_split: document.getElementById('trainHandSplit').checked,
+      model_type: _selectedModelType,
+      lr0: parseFloat(document.getElementById('trainLr0').value),
+      optimizer: document.getElementById('trainOptimizer').value,
+      patience: parseInt(document.getElementById('trainPatience').value),
+      label_smoothing: parseFloat(document.getElementById('trainLabelSmoothing').value),
+      amp: document.getElementById('trainAmp').checked,
+      cos_lr: document.getElementById('trainCosLr').checked,
+    });
+    if (res.status === 'ok') {
+      showToast('训练已启动 (PID: ' + res.pid + ')');
+      updateTrainStatus();
+    } else {
+      showToast(res.message || '启动失败', 'error');
+    }
+  } catch (e) {
+    showToast('启动失败: ' + e.message, 'error');
+  }
+}
+
+async function stopTraining() {
+  try {
+    await api('/api/train/stop', 'POST');
+    showToast('训练已停止');
+    updateTrainStatus();
+  } catch (e) {
+    showToast('停止失败', 'error');
+  }
+}
+
+async function updateTrainStatus() {
+  try {
+    const res = await api('/api/train/status');
+    const btnStart = document.getElementById('btnTrainStart');
+    const btnStop = document.getElementById('btnTrainStop');
+    const statusText = document.getElementById('trainStatusText');
+
+    if (res.running) {
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      statusText.textContent = '训练中... PID: ' + res.pid + ' | 数据集: ' + (res.name || '-') + ' | 开始: ' + (res.start_time || '-');
+      statusText.style.color = 'var(--success)';
+    } else {
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      statusText.textContent = res.pid ? '训练已结束' : '';
+      statusText.style.color = 'var(--text-dim)';
+    }
+  } catch (e) {}
+}
+
+async function loadModels() {
+  try {
+    const res = await api('/api/train/models');
+    const list = document.getElementById('modelList');
+
+    if (!res.models || res.models.length === 0) {
+      list.innerHTML = '<div style="color:var(--text-dim); font-size:13px;">暂无已训练模型</div>';
+      return;
+    }
+
+    list.innerHTML = res.models.map(m => {
+      return `<div style="display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--border);">
+        <div style="flex:1; min-width:0;">
+          <div style="font-size:13px; font-weight:600;">${m.name}</div>
+          <div style="font-size:11px; color:var(--text-dim);">${m.modified}${m.best ? ' | best.pt' : ''}${m.last ? ' | last.pt' : ''}</div>
+        </div>
+        <button class="btn btn-outline" style="padding:4px 10px; font-size:11px;" onclick="showAnalysis('${m.name}')">分布图</button>
+        ${m.best ? `<button class="btn btn-primary" style="padding:4px 10px; font-size:11px;" onclick="useModel('${m.best.replace(/\\/g, '\\\\')}')">使用最佳</button>` : ''}
+        ${m.last ? `<button class="btn btn-outline" style="padding:4px 10px; font-size:11px;" onclick="useModel('${m.last.replace(/\\/g, '\\\\')}')">使用最新</button>` : ''}
+      </div>`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('modelList').innerHTML =
+      '<div style="color:var(--danger); font-size:13px;">加载失败</div>';
+  }
+}
+
+function useModel(path) {
+  document.getElementById('modelPath').value = path;
+  showToast('已选择模型，请保存配置后启动动捕');
+}
+
+// ============ 分布分析图 ============
+
+async function showAnalysis(modelName) {
+  const modal = document.getElementById('analysisModal');
+  const content = document.getElementById('analysisContent');
+  const title = document.getElementById('analysisTitle');
+  modal.style.display = 'flex';
+  title.textContent = '关键点命中分布分析 - ' + modelName;
+  content.innerHTML = '<div style="color:var(--text-dim); text-align:center; padding:40px;">加载中...</div>';
+
+  try {
+    const res = await api('/api/train/analysis?model=' + encodeURIComponent(modelName));
+    if (res.error && (!res.images || res.images.length === 0)) {
+      content.innerHTML = '<div style="color:var(--text-dim); text-align:center; padding:40px;">' + res.error + '</div>';
+      return;
+    }
+
+    if (!res.images || res.images.length === 0) {
+      content.innerHTML = '<div style="color:var(--text-dim); text-align:center; padding:40px;">暂无分析图，训练完成后自动生成</div>';
+      return;
+    }
+
+    content.innerHTML = res.images.map(img => {
+      const label = img.name === 'keypoint_distribution' ? '关键点命中率 & 置信度分布' :
+                    img.name === 'keypoint_heatmap' ? '关键点置信度热力图' : img.name;
+      return `<div style="margin-bottom:20px;">
+        <div style="font-size:13px; font-weight:600; margin-bottom:8px; color:var(--accent);">${label}</div>
+        <img src="${img.path}" style="width:100%; border-radius:8px; border:1px solid var(--border);" alt="${label}">
+      </div>`;
+    }).join('');
+  } catch (e) {
+    content.innerHTML = '<div style="color:var(--danger); text-align:center; padding:40px;">加载失败: ' + e.message + '</div>';
+  }
+}
+
+function closeAnalysis() {
+  document.getElementById('analysisModal').style.display = 'none';
+}
+
+// ============ 文件夹浏览器 ============
+
+let _browseCurrentPath = '';
+
+function openFolderBrowser() {
+  const modal = document.getElementById('folderModal');
+  modal.style.display = 'flex';
+  browseLoad('');  // 加载快捷入口
+}
+
+function closeFolderBrowser() {
+  document.getElementById('folderModal').style.display = 'none';
+}
+
+async function browseLoad(path) {
+  const listEl = document.getElementById('browseList');
+  const shortcutsEl = document.getElementById('browseShortcuts');
+  const pathInput = document.getElementById('browsePathInput');
+  const currentPathEl = document.getElementById('browseCurrentPath');
+
+  listEl.innerHTML = '<div style="color:var(--text-dim); font-size:13px; padding:20px; text-align:center;">加载中...</div>';
+
+  try {
+    const url = '/api/browse' + (path ? '?path=' + encodeURIComponent(path) : '');
+    const res = await (await fetch(url)).json();
+
+    if (res.type === 'error') {
+      listEl.innerHTML = `<div style="color:var(--danger); font-size:13px; padding:20px; text-align:center;">${res.message}</div>`;
+      return;
+    }
+
+    if (res.type === 'shortcuts') {
+      // 显示快捷入口
+      shortcutsEl.style.display = 'flex';
+      shortcutsEl.innerHTML = res.shortcuts.map(s =>
+        `<button class="btn btn-outline" style="padding:4px 10px; font-size:12px;" onclick="browseLoad('${s.path.replace(/\\/g, '\\\\')}')">${s.name}</button>`
+      ).join('');
+      listEl.innerHTML = '<div style="color:var(--text-dim); font-size:13px; padding:20px; text-align:center;">点击上方快捷入口浏览目录</div>';
+      pathInput.value = '';
+      currentPathEl.textContent = '';
+      _browseCurrentPath = '';
+      return;
+    }
+
+    // 目录列表
+    shortcutsEl.style.display = 'none';
+    _browseCurrentPath = res.current;
+    pathInput.value = res.current;
+    currentPathEl.textContent = res.current;
+
+    if (res.entries.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text-dim); font-size:13px; padding:20px; text-align:center;">此目录下没有子文件夹</div>';
+      return;
+    }
+
+    listEl.innerHTML = res.entries.map(e => {
+      const tags = [];
+      if (e.has_dataset_yaml) tags.push('<span style="font-size:10px; padding:1px 6px; border-radius:3px; background:rgba(0,184,148,0.15); color:var(--success);">yaml</span>');
+      if (e.has_images) tags.push('<span style="font-size:10px; padding:1px 6px; border-radius:3px; background:rgba(108,92,231,0.15); color:var(--accent);">images</span>');
+      if (e.has_labels) tags.push('<span style="font-size:10px; padding:1px 6px; border-radius:3px; background:rgba(253,203,110,0.2); color:var(--warning);">labels</span>');
+      const isDataset = e.has_dataset_yaml && e.has_images;
+      return `<div onclick="browseLoad('${e.path.replace(/\\/g, '\\\\')}')" style="display:flex; align-items:center; gap:10px; padding:8px 20px; cursor:pointer; transition:background 0.15s;" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='transparent'">
+        <span style="font-size:14px; color:var(--accent);">📁</span>
+        <span style="flex:1; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${e.name}</span>
+        <div style="display:flex; gap:4px;">${tags.join('')}</div>
+        ${isDataset ? '<span style="font-size:10px; padding:1px 6px; border-radius:3px; background:rgba(0,184,148,0.2); color:var(--success); font-weight:600;">数据集</span>' : ''}
+      </div>`;
+    }).join('');
+
+  } catch (e) {
+    listEl.innerHTML = '<div style="color:var(--danger); font-size:13px; padding:20px; text-align:center;">加载失败</div>';
+  }
+}
+
+function browseGoParent() {
+  if (_browseCurrentPath) {
+    const parent = _browseCurrentPath.replace(/[\\\/][^\\\/]+[\\\/]?$/, '');
+    browseLoad(parent || '');
+  } else {
+    browseLoad('');
+  }
+}
+
+function browseGoTo(path) {
+  if (path.trim()) browseLoad(path.trim());
+}
+
+function selectCurrentFolder() {
+  if (_browseCurrentPath) {
+    document.getElementById('importPath').value = _browseCurrentPath;
+    // 自动填充名称
+    const nameInput = document.getElementById('importName');
+    if (!nameInput.value) {
+      const parts = _browseCurrentPath.replace(/\\/g, '/').split('/');
+      nameInput.value = parts[parts.length - 1] || '';
+    }
+    closeFolderBrowser();
+    showToast('已选择: ' + _browseCurrentPath);
+  } else {
+    showToast('请先选择一个文件夹', 'error');
+  }
+}
+
+// ============ 初始化 ============
+
+document.addEventListener('DOMContentLoaded', () => {
+  // 绑定所有 range 控件
+  ['confThreshold', 'faceDetConf', 'faceTrkConf', 'faceMinCutoff',
+   'faceBeta', 'faceSmoothFactor', 'blendshapeSmoothing', 'facePresenceConf',
+   'headRotSmoothing', 'headPosScale', 'headPosYOffset',
+   'procMinCutoff', 'procBeta',
+   'handDetConf', 'handTrkConf', 'handMinCutoff', 'handBeta',
+   'backCurlComp', 'backRollComp'].forEach(bindRange);
+
+  document.getElementById('faceEnabled').addEventListener('change', function() {
+    toggleFaceSettings();
+    autoSaveConfig();
+  });
+  document.getElementById('bodyEnabled').addEventListener('change', function() {
+    toggleBodySettings();
+    autoSaveConfig();
+  });
+  document.getElementById('handEnabled').addEventListener('change', function() {
+    toggleHandSettings();
+    autoSaveConfig();
+  });
+  document.getElementById('palmBackClassify').addEventListener('change', togglePalmBackSettings);
+
+  // 推流管理卡片: 推流开关
+  ['bodyStreamingEnabled', 'handStreamingEnabled', 'faceStreamingEnabled'].forEach(id => {
+    document.getElementById(id).addEventListener('change', () => {
+      autoSaveConfig();
+    });
+  });
+
+  // 推流协议变更
+  document.getElementById('bodyProtocol').addEventListener('change', () => {
+    onProtocolChange();
+    autoSaveConfig();
+  });
+
+  // VMT/VMC/OSC 端口变更自动保存
+  ['vmtHost', 'vmtPort', 'vmcPort', 'bodyPort', 'faceHost', 'facePort', 'handHost', 'handPort'].forEach(id => {
+    document.getElementById(id).addEventListener('change', autoSaveConfig);
+  });
+
+  // 身体部位开关 <-> tracker_toggles 双向同步
+  ['detectTorso','detectLeftArm','detectRightArm','detectLeftLeg','detectRightLeg'].forEach(id => {
+    document.getElementById(id).addEventListener('change', () => {
+      syncBodyDetectToTrackers(id);
+      autoSaveConfig();
+    });
+  });
+  document.querySelectorAll('.tracker-toggle').forEach(el => {
+    el.addEventListener('change', () => {
+      syncTrackerToBodyDetect(el.dataset.bone);
+      autoSaveConfig();
+    });
+  });
+
+  loadConfig();
+  updateStatus();
+  loadDatasets();
+  loadModels();
+  updateTrainStatus();
+  updateStatus();
+  refreshLog();
+  updateInferenceStatus();
+  setInterval(updateStatus, 3000);
+  setInterval(updateTrainStatus, 5000);
+  setInterval(updateInferenceStatus, 3000);
+  startLogAutoRefresh();
+});
+</script>
+
+<!-- 悬浮操作栏 -->
+<div class="fab-group">
+  <button class="fab-sm fab-reload" onclick="loadConfig()">重新加载</button>
+  <button class="fab-sm fab-save" onclick="saveAll()">保存配置</button>
+  <button class="fab-power off" id="fabPower" onclick="togglePower()">
+    <span class="power-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="2" x2="12" y2="12"/><path d="M16.24 7.76a6 6 0 1 1-8.49 0"/></svg></span>
+  </button>
+</div>
+
+</body>
+</html>

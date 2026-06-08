@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# PyInstaller
+*.spec.bak
+*.manifest
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ultralytics 缓存
+bin/.ultralytics/
+
+# 模型文件 (体积大，需单独下载)
+*.pt
+*.pth
+*.onnx
+*.task
+
+# 训练输出
+runs/
+
+# 数据集
+datasets/*/
+!datasets/.gitkeep
+sample_dataset/
+
+# 日志
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# 打包输出
+*.zip
+YOLO26n-VRC-Mocap_*/
+
+# OneDrive 备份
+*.backup
