@@ -4,7 +4,10 @@ import numpy as np
 import threading
 import time
 import os
+from runtime_paths import bin_dir, resource_root, runtime_root
+from mediapipe_runtime import next_timestamp_ms
 from typing import Dict, Optional, List, Tuple
+from face_calibration import apply_vrcft_calibration
 
 
 # MediaPipe 52 blendshapes 名称 -> VRCFT Unified Expressions v2 参数映射
@@ -41,10 +44,10 @@ MEDIAPIPE_TO_VRCFT = {
     "mouthShrugLower":       "v2/MouthLowerDownLeft",   # 近似映射
     "mouthShrugUpper":       "v2/MouthUpperUpLeft",     # 近似映射
     # 眼睛
-    "eyeBlinkLeft":          "v2/EyeLidLeft",
-    "eyeBlinkRight":         "v2/EyeLidRight",
-    "eyeWideLeft":           "v2/EyeLidLeft",           # 宽眼叠加
-    "eyeWideRight":          "v2/EyeLidRight",          # 宽眼叠加
+    "eyeBlinkLeft":          "v2/EyeClosedLeft",
+    "eyeBlinkRight":         "v2/EyeClosedRight",
+    "eyeWideLeft":           "v2/EyeWideLeft",
+    "eyeWideRight":          "v2/EyeWideRight",
     "eyeSquintLeft":         "v2/EyeSquintLeft",
     "eyeSquintRight":        "v2/EyeSquintRight",
     "eyeLookDownLeft":       "v2/EyeLeftY",             # 负值=下看
@@ -82,10 +85,10 @@ _MERGE_PARAMS = {
     "v2/EyeRightX":  {"eyeLookInRight": 1.0, "eyeLookOutRight": -1.0},
 }
 
-# 眼睛闭合参数: blink 值反转 (1-blink = 睁开度), widen 值叠加
+# 眼睛闭合参数: 左右 blink 独立输出，EyeLid 仅作为旧模型兼容值
 _EYE_COMBINE = {
-    "v2/EyeLidLeft":  {"blink": "eyeBlinkLeft", "widen": "eyeWideLeft"},
-    "v2/EyeLidRight": {"blink": "eyeBlinkRight", "widen": "eyeWideRight"},
+    "Left":  {"blink": "eyeBlinkLeft", "widen": "eyeWideLeft"},
+    "Right": {"blink": "eyeBlinkRight", "widen": "eyeWideRight"},
 }
 
 # 眉毛内侧上扬: browInnerUp 同时映射到左右
@@ -112,15 +115,16 @@ class OneEuroFilter1D:
 
     def filter(self, x: float, t: float = None) -> float:
         if self.t_prev is None:
-            self.t_prev = t or time.perf_counter()
+            self.t_prev = time.perf_counter() if t is None else t
             self.x_prev = x
             self.dx_prev = 0.0
             return x
 
-        t = t or time.perf_counter()
+        t = time.perf_counter() if t is None else t
         dt = t - self.t_prev
-        if dt <= 0:
-            dt = 1.0 / self.freq
+        if not np.isfinite(dt) or dt <= 0:
+            dt = 1.0 / max(self.freq, 1.0)
+        dt = min(max(dt, 1e-4), 1.0)
 
         self.freq = 1.0 / dt
 
@@ -143,8 +147,9 @@ class OneEuroFilter1D:
         return x_hat
 
     def _smoothing_factor(self, cutoff: float) -> float:
-        r = 2 * np.pi * cutoff / self.freq
-        return 1.0 / (1.0 + r + r * r / 2.0)
+        # Casiez et al.: alpha = r / (1 + r), r = 2*pi*fc*dt
+        r = 2 * np.pi * max(0.0, cutoff) / self.freq
+        return r / (1.0 + r)
 
     def _exponential_smoothing(self, a: float, x: float, x_prev: float) -> float:
         return a * x + (1 - a) * x_prev
@@ -196,8 +201,9 @@ class FaceLandmarkDetector:
 
     # 模型文件搜索路径（相对于本文件和项目根目录）
     _MODEL_SEARCH_DIRS = [
-        os.path.dirname(os.path.abspath(__file__)),               # bin/
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # 项目根
+        str(bin_dir()),
+        str(runtime_root()),
+        str(resource_root()),
     ]
 
     def __init__(self, max_num_faces: int = 1, refine_landmarks: bool = True,
@@ -208,7 +214,16 @@ class FaceLandmarkDetector:
                  blendshape_smoothing: float = 0.0,
                  head_position_scale: float = 1.0,
                  head_position_offset: list = None,
-                 head_rotation_smoothing: float = 0.3):
+                 head_rotation_smoothing: float = 0.3,
+                 vrcft_calibration: Dict = None,
+                 model_path: str = None,
+                 mouth_shape_mapping_enabled: bool = True,
+                 mouth_shape_gain: float = 1.25,
+                 mouth_shape_deadzone: float = 0.03,
+                 eyelid_independent_enabled: bool = True,
+                 eyelid_close_gain: float = 1.35,
+                 eyelid_close_deadzone: float = 0.04,
+                 eyelid_send_combined: bool = False):
         self.max_num_faces = max_num_faces
         self.refine_landmarks = refine_landmarks
         self.min_detection_confidence = min_detection_confidence
@@ -217,6 +232,7 @@ class FaceLandmarkDetector:
 
         self.face_landmarker = None
         self.is_loaded = False
+        self.model_path = model_path
 
         # 平滑参数
         self.smoothing = smoothing
@@ -250,6 +266,14 @@ class FaceLandmarkDetector:
         #   佩戴头显时旋转数据可能有抖动，需要额外平滑
         #   推荐值: 0.2~0.5
         self.head_rotation_smoothing = head_rotation_smoothing
+        self.vrcft_calibration = vrcft_calibration or {}
+        self.mouth_shape_mapping_enabled = bool(mouth_shape_mapping_enabled)
+        self.mouth_shape_gain = float(mouth_shape_gain)
+        self.mouth_shape_deadzone = float(mouth_shape_deadzone)
+        self.eyelid_independent_enabled = bool(eyelid_independent_enabled)
+        self.eyelid_close_gain = float(eyelid_close_gain)
+        self.eyelid_close_deadzone = float(eyelid_close_deadzone)
+        self.eyelid_send_combined = bool(eyelid_send_combined)
 
         # OneEuro 滤波器（每个参数独立滤波）
         self._filters: Dict[str, OneEuroFilter1D] = {}
@@ -266,6 +290,10 @@ class FaceLandmarkDetector:
         # LIVE_STREAM 模式下推理在 MediaPipe 内部线程执行，不阻塞主循环
         # 回调结果缓存到 _latest_result，主循环通过 detect() 读取
         self._latest_result = None
+        self._latest_result_timestamp = -1
+        self._consumed_result_timestamp = -1
+        self._latest_face_data = None
+        self.last_result_fresh = False
         self._result_lock = threading.Lock()
         self._frame_timestamp = 0
 
@@ -280,6 +308,11 @@ class FaceLandmarkDetector:
 
     def _find_model_file(self) -> Optional[str]:
         """搜索 face_landmarker.task 模型文件"""
+        if self.model_path:
+            path = os.path.abspath(os.path.expanduser(self.model_path))
+            if os.path.exists(path):
+                return path
+            print(f"Configured face model not found: {path}")
         model_name = "face_landmarker.task"
         for d in self._MODEL_SEARCH_DIRS:
             path = os.path.join(d, model_name)
@@ -297,6 +330,7 @@ class FaceLandmarkDetector:
                 print("Download from: https://storage.googleapis.com/mediapipe-models/"
                       "face_landmarker/face_landmarker/float16/latest/face_landmarker.task")
                 return False
+            print(f"Face Landmarker model: {model_path}")
 
             tasks = mp.tasks.vision
             BaseOptions = mp.tasks.BaseOptions
@@ -322,6 +356,17 @@ class FaceLandmarkDetector:
                   f"presence_conf={self.min_face_presence_confidence}, trk_conf={self.min_tracking_confidence})")
             if self.blendshape_smoothing > 0:
                 print(f"  Blendshape smoothing: {self.blendshape_smoothing}")
+            if self.mouth_shape_mapping_enabled:
+                print(f"  Mouth shape mapping: enabled (gain={self.mouth_shape_gain}, "
+                      f"deadzone={self.mouth_shape_deadzone})")
+            else:
+                print("  Mouth shape mapping: disabled")
+            if self.eyelid_independent_enabled:
+                print(f"  Eyelid independent closure: enabled (gain={self.eyelid_close_gain}, "
+                      f"deadzone={self.eyelid_close_deadzone}, "
+                      f"combined={'on' if self.eyelid_send_combined else 'off'})")
+            else:
+                print("  Eyelid independent closure: disabled")
             if self.head_position_scale != 1.0 or any(v != 0 for v in self.head_position_offset):
                 print(f"  Head position: scale={self.head_position_scale}, offset={self.head_position_offset}")
             if self.head_rotation_smoothing > 0:
@@ -329,7 +374,7 @@ class FaceLandmarkDetector:
             return True
         except ImportError:
             print("mediapipe not installed, face tracking disabled")
-            print("Install with: pip install mediapipe")
+            print("Install with: uv sync")
             return False
         except Exception as e:
             print(f"Error loading Face Landmarker: {e}")
@@ -343,6 +388,15 @@ class FaceLandmarkDetector:
         """
         with self._result_lock:
             self._latest_result = result
+            self._latest_result_timestamp = int(timestamp_ms)
+
+    def _take_latest_result(self):
+        """Consume each asynchronous result at most once."""
+        with self._result_lock:
+            if self._latest_result_timestamp <= self._consumed_result_timestamp:
+                return None
+            self._consumed_result_timestamp = self._latest_result_timestamp
+            return self._latest_result
 
     def detect(self, frame: np.ndarray) -> Optional[Dict]:
         if not self.is_loaded or self.face_landmarker is None:
@@ -355,15 +409,21 @@ class FaceLandmarkDetector:
 
         # LIVE_STREAM 异步模式: 提交帧到推理队列，不阻塞
         # 参考 mediapipe-vt: detect_async + 回调缓存结果
-        self._frame_timestamp += 1
+        self._frame_timestamp = next_timestamp_ms(self._frame_timestamp)
         ts = self._frame_timestamp
         self.face_landmarker.detect_async(mp_image, ts)
 
-        # 读取异步回调缓存的最新结果
-        with self._result_lock:
-            result = self._latest_result
+        # MediaPipe may complete more slowly than the main loop. Reusing the
+        # processed data is useful for preview, but smoothing and OSC must only
+        # advance once for each callback result.
+        result = self._take_latest_result()
+        if result is None:
+            self.last_result_fresh = False
+            return self._latest_face_data
 
         if result is None or not result.face_landmarks:
+            self.last_result_fresh = True
+            self._latest_face_data = None
             return None
 
         landmarks = result.face_landmarks[0]
@@ -442,7 +502,8 @@ class FaceLandmarkDetector:
                 self._face_rotation_smoothed = list(raw_rot)
 
         # 计算 VRCFT Unified Expressions 参数
-        vrcft_params = self._blendshapes_to_vrcft(bs_dict)
+        vrcft_raw = self._blendshapes_to_vrcft(bs_dict)
+        vrcft_params = apply_vrcft_calibration(vrcft_raw, self.vrcft_calibration)
 
         # 计算简化面部参数（兼容旧接口）
         face_data = self._compute_face_params(points, w, h)
@@ -451,6 +512,7 @@ class FaceLandmarkDetector:
 
         # 添加 VRCFT 标准参数
         face_data["vrcft"] = vrcft_params
+        face_data["vrcft_raw"] = dict(vrcft_raw)
         # 添加原始 blendshapes（调试用）
         face_data["blendshapes_raw"] = bs_dict
 
@@ -458,6 +520,8 @@ class FaceLandmarkDetector:
         face_data["face_position"] = list(self._face_position)
         face_data["face_rotation"] = list(self._face_rotation)
 
+        self._latest_face_data = face_data
+        self.last_result_fresh = True
         return face_data
 
     def _blendshapes_to_vrcft(self, bs_dict: Dict[str, float]) -> Dict[str, float]:
@@ -466,7 +530,7 @@ class FaceLandmarkDetector:
         参考 VRCFT 标准:
         - Jaw 参数: v2/JawOpen, v2/MouthClosed, v2/JawX, v2/JawZ
         - 嘴部参数: v2/MouthSmileLeft/Right, v2/MouthFrownLeft/Right, etc.
-        - 眼睛参数: v2/EyeLidLeft/Right (0-0.75=睁开, 0.75-1.0=宽眼)
+        - 眼睛参数: v2/EyeClosedLeft/Right, v2/EyeOpenLeft/Right, v2/EyeLidLeft/Right
         - 眉毛参数: v2/BrowInnerUpLeft/Right, v2/BrowOuterUpLeft/Right, etc.
         - 唇部参数: v2/LipFunnel, v2/LipPucker, etc.
 
@@ -529,7 +593,7 @@ class FaceLandmarkDetector:
             val = bs_dict.get(mp_name, 0.0)
             # 嘴部参数跳过 OneEuro 二次滤波（已在 blendshape 阶段用低系数平滑过）
             if self.mouth_skip_vrcft_smooth and vrcft_name in _MOUTH_VRCFT_PARAMS:
-                vrcft[vrcft_name] = float(np.clip(val, 0.0, 1.0))
+                vrcft[vrcft_name] = self._mouth_shape_value(val)
             else:
                 val = self._apply_smooth(f"vrcft_{vrcft_name}", val, t)
                 vrcft[vrcft_name] = float(np.clip(val, 0.0, 1.0))
@@ -537,9 +601,9 @@ class FaceLandmarkDetector:
         # ===== 2. 合并映射: JawX (左负右正) =====
         jaw_left = bs_dict.get("jawLeft", 0.0)
         jaw_right = bs_dict.get("jawRight", 0.0)
-        jaw_x = jaw_right - jaw_left
+        jaw_x = self._mouth_shape_value(jaw_right - jaw_left, signed=True)
         if self.mouth_skip_vrcft_smooth:
-            vrcft["v2/JawX"] = float(np.clip(jaw_x, -1.0, 1.0))
+            vrcft["v2/JawX"] = jaw_x
         else:
             jaw_x = self._apply_smooth("vrcft_v2/JawX", jaw_x, t)
             vrcft["v2/JawX"] = float(np.clip(jaw_x, -1.0, 1.0))
@@ -547,29 +611,37 @@ class FaceLandmarkDetector:
         # ===== 3. 合并映射: MouthX (左负右正) =====
         mouth_left = bs_dict.get("mouthLeft", 0.0)
         mouth_right = bs_dict.get("mouthRight", 0.0)
-        mouth_x = mouth_right - mouth_left
+        mouth_x = self._mouth_shape_value(mouth_right - mouth_left, signed=True)
         if self.mouth_skip_vrcft_smooth:
-            vrcft["v2/MouthX"] = float(np.clip(mouth_x, -1.0, 1.0))
+            vrcft["v2/MouthX"] = mouth_x
         else:
             mouth_x = self._apply_smooth("vrcft_v2/MouthX", mouth_x, t)
             vrcft["v2/MouthX"] = float(np.clip(mouth_x, -1.0, 1.0))
 
-        # ===== 4. 眼睛: EyeLid (0-0.75=睁开度, 0.75-1.0=宽眼) =====
-        # VRCFT 标准: EyeLidLeft/Right
-        #   0.0 = 完全闭合, 0.75 = 正常睁开, 1.0 = 睁大
-        # MediaPipe: eyeBlink (0=睁开, 1=闭合), eyeWide (0=正常, 1=宽眼)
+        # ===== 4. 眼睛: 左右独立闭合 + EyeLid 兼容输出 =====
+        # MediaPipe: eyeBlinkLeft/Right 是独立闭眼系数。这里先输出
+        # v2/EyeClosedLeft/Right，再派生 EyeOpen 和旧 EyeLid，避免单眼闭合
+        # 被宽眼/另一只眼混合污染。
         for side, blink_name, widen_name in [
             ("Left", "eyeBlinkLeft", "eyeWideLeft"),
             ("Right", "eyeBlinkRight", "eyeWideRight"),
         ]:
             blink = bs_dict.get(blink_name, 0.0)
             widen = bs_dict.get(widen_name, 0.0)
-            # 闭合度反转: openness = 1 - blink
-            openness = 1.0 - blink
-            # 映射到 VRCFT 范围: 0-0.75 为睁开度, 0.75-1.0 为宽眼
-            eye_lid = openness * 0.75 + widen * 0.25
-            eye_lid = self._apply_smooth(f"vrcft_v2/EyeLid{side}", eye_lid, t)
+
+            closed = self._eyelid_closed_value(blink)
+            closed = self._apply_smooth(f"vrcft_v2/EyeClosed{side}", closed, t)
+            closed = float(np.clip(closed, 0.0, 1.0))
+
+            open_value = float(np.clip(1.0 - closed, 0.0, 1.0))
+            wide = self._apply_smooth(f"vrcft_v2/EyeWide{side}", widen, t)
+            wide = float(np.clip(wide, 0.0, 1.0))
+
+            eye_lid = open_value * 0.75 + wide * 0.25
             vrcft[f"v2/EyeLid{side}"] = float(np.clip(eye_lid, 0.0, 1.0))
+            vrcft[f"v2/EyeClosed{side}"] = closed
+            vrcft[f"v2/EyeOpen{side}"] = open_value
+            vrcft[f"v2/EyeWide{side}"] = wide
 
         # ===== 5. 眼睛视线: EyeX/Y =====
         # EyeLeftX: 正=右看, 负=左看
@@ -605,34 +677,37 @@ class FaceLandmarkDetector:
         vrcft["v2/BrowInnerUpLeft"] = float(np.clip(brow_inner_l, 0.0, 1.0))
         vrcft["v2/BrowInnerUpRight"] = float(np.clip(brow_inner_r, 0.0, 1.0))
 
-        # ===== 7. 简化参数 (VRCFT Blended Shapes) =====
-        # MouthOpen = MouthUpperUp + MouthLowerDown
-        vrcft["v2/MouthOpen"] = float(np.clip(
-            (vrcft.get("v2/MouthUpperUpLeft", 0) + vrcft.get("v2/MouthUpperUpRight", 0)) / 2 +
-            (vrcft.get("v2/MouthLowerDownLeft", 0) + vrcft.get("v2/MouthLowerDownRight", 0)) / 2,
-            0.0, 1.0
-        ))
+        # ===== 7. 简化/复合嘴型参数 =====
+        lower_down = self._avg_vrcft(vrcft, "v2/MouthLowerDownLeft", "v2/MouthLowerDownRight")
+        upper_up = self._avg_vrcft(vrcft, "v2/MouthUpperUpLeft", "v2/MouthUpperUpRight")
+        jaw_open = vrcft.get("v2/JawOpen", 0.0)
+        mouth_open = max(jaw_open, lower_down * 0.65 + upper_up * 0.35)
+        vrcft["v2/MouthOpen"] = float(np.clip(mouth_open, 0.0, 1.0))
 
-        # LipFunnel (合并上下)
-        vrcft["v2/LipFunnel"] = vrcft.get("v2/LipFunnel", 0.0)
-        # LipPucker (合并上下)
-        vrcft["v2/LipPucker"] = vrcft.get("v2/LipPucker", 0.0)
+        vrcft["v2/MouthSmile"] = self._avg_vrcft(vrcft, "v2/MouthSmileLeft", "v2/MouthSmileRight")
+        vrcft["v2/MouthFrown"] = self._avg_vrcft(vrcft, "v2/MouthFrownLeft", "v2/MouthFrownRight")
+        vrcft["v2/MouthPress"] = self._avg_vrcft(vrcft, "v2/MouthPressLeft", "v2/MouthPressRight")
+        vrcft["v2/MouthStretch"] = self._avg_vrcft(vrcft, "v2/MouthStretchLeft", "v2/MouthStretchRight")
+        vrcft["v2/MouthDimple"] = self._avg_vrcft(vrcft, "v2/MouthDimpleLeft", "v2/MouthDimpleRight")
 
-        # EyeLid (合并左右)
-        vrcft["v2/EyeLid"] = float(np.clip(
-            (vrcft.get("v2/EyeLidLeft", 0.75) + vrcft.get("v2/EyeLidRight", 0.75)) / 2,
-            0.0, 1.0
-        ))
-
-        # EyeSquint (合并左右)
-        vrcft["v2/EyeSquint"] = float(np.clip(
-            (vrcft.get("v2/EyeSquintLeft", 0) + vrcft.get("v2/EyeSquintRight", 0)) / 2,
-            0.0, 1.0
-        ))
+        if self.eyelid_send_combined:
+            # Optional legacy compatibility. Disabled by default because a global
+            # EyeLid/EyeClosed parameter can override wink-capable left/right params.
+            vrcft["v2/EyeLid"] = float(np.clip(
+                (vrcft.get("v2/EyeLidLeft", 0.75) + vrcft.get("v2/EyeLidRight", 0.75)) / 2,
+                0.0, 1.0
+            ))
+            vrcft["v2/EyeClosed"] = self._avg_vrcft(vrcft, "v2/EyeClosedLeft", "v2/EyeClosedRight")
+            vrcft["v2/EyeOpen"] = self._avg_vrcft(vrcft, "v2/EyeOpenLeft", "v2/EyeOpenRight")
+            vrcft["v2/EyeSquint"] = float(np.clip(
+                (vrcft.get("v2/EyeSquintLeft", 0) + vrcft.get("v2/EyeSquintRight", 0)) / 2,
+                0.0, 1.0
+            ))
 
         # ===== 8. 追踪激活状态 =====
         vrcft["ExpressionTrackingActive"] = 1.0
         vrcft["LipTrackingActive"] = 1.0
+        vrcft["EyeTrackingActive"] = 1.0
 
         return vrcft
 
@@ -731,6 +806,48 @@ class FaceLandmarkDetector:
             self._smooth_values[name] = smoothed
             return smoothed
 
+    def _mouth_shape_value(self, value: float, signed: bool = False) -> float:
+        """Apply mouth-shape deadzone/gain without changing calibration storage."""
+        if not self.mouth_shape_mapping_enabled:
+            low, high = (-1.0, 1.0) if signed else (0.0, 1.0)
+            return float(np.clip(value, low, high))
+
+        raw = float(value)
+        deadzone = max(0.0, float(self.mouth_shape_deadzone))
+        gain = max(0.0, float(self.mouth_shape_gain))
+
+        if signed:
+            if abs(raw) <= deadzone:
+                return 0.0
+            shaped = np.sign(raw) * ((abs(raw) - deadzone) / max(1e-6, 1.0 - deadzone))
+            return float(np.clip(shaped * gain, -1.0, 1.0))
+
+        if raw <= deadzone:
+            return 0.0
+        shaped = (raw - deadzone) / max(1e-6, 1.0 - deadzone)
+        return float(np.clip(shaped * gain, 0.0, 1.0))
+
+    def _eyelid_closed_value(self, value: float) -> float:
+        """Map MediaPipe eyeBlinkLeft/Right to a stable 0..1 closed value."""
+        raw = float(value)
+        if not self.eyelid_independent_enabled:
+            return float(np.clip(raw, 0.0, 1.0))
+
+        deadzone = max(0.0, float(self.eyelid_close_deadzone))
+        gain = max(0.0, float(self.eyelid_close_gain))
+        if raw <= deadzone:
+            return 0.0
+        shaped = (raw - deadzone) / max(1e-6, 1.0 - deadzone)
+        return float(np.clip(shaped * gain, 0.0, 1.0))
+
+    @staticmethod
+    def _avg_vrcft(values: Dict[str, float], left_key: str, right_key: str) -> float:
+        return float(np.clip(
+            (values.get(left_key, 0.0) + values.get(right_key, 0.0)) * 0.5,
+            0.0,
+            1.0,
+        ))
+
     def _eye_aspect_ratio(self, top, bottom, left, right) -> float:
         vertical = np.linalg.norm(top - bottom)
         horizontal = np.linalg.norm(left - right)
@@ -760,6 +877,10 @@ class FaceLandmarkDetector:
         self._face_rotation_smoothed = [0.0, 0.0, 0.0]
         with self._result_lock:
             self._latest_result = None
+            self._latest_result_timestamp = -1
+            self._consumed_result_timestamp = -1
+        self._latest_face_data = None
+        self.last_result_fresh = False
         print("Face filters reset")
 
     def set_low_light_mode(self, enabled: bool = True):
@@ -784,6 +905,28 @@ class FaceLandmarkDetector:
                 f.beta = 0.007
                 f.min_cutoff = 1.0
             print("Face: low-light mode OFF (beta=0.007, min_cutoff=1.0)")
+
+    def update_vrcft_calibration(self, calibration: Dict):
+        """Update VRCFT calibration without restarting the detector."""
+        self.vrcft_calibration = calibration or {}
+
+    def update_mouth_shape_mapping(self, enabled: bool = True,
+                                   gain: float = 1.25,
+                                   deadzone: float = 0.03):
+        """Update mouth-shape remap settings without restarting face tracking."""
+        self.mouth_shape_mapping_enabled = bool(enabled)
+        self.mouth_shape_gain = float(gain)
+        self.mouth_shape_deadzone = float(deadzone)
+
+    def update_eyelid_mapping(self, enabled: bool = True,
+                              gain: float = 1.35,
+                              deadzone: float = 0.04,
+                              send_combined: bool = False):
+        """Update eyelid remap settings without restarting face tracking."""
+        self.eyelid_independent_enabled = bool(enabled)
+        self.eyelid_close_gain = float(gain)
+        self.eyelid_close_deadzone = float(deadzone)
+        self.eyelid_send_combined = bool(send_combined)
 
     def draw_face_landmarks(self, frame: np.ndarray, face_data: Dict) -> np.ndarray:
         """在画面上绘制面部关键点和嘴部状态"""
@@ -833,21 +976,27 @@ class FaceLandmarkDetector:
         # VRCFT 参数显示
         vrcft = face_data.get("vrcft", {})
         if vrcft:
-            cv2.putText(frame, f"VRCFT JawOpen: {vrcft.get('v2/JawOpen', 0):.2f}",
+            cv2.putText(frame, f"Open: {vrcft.get('v2/MouthOpen', 0):.2f}  Jaw: {vrcft.get('v2/JawOpen', 0):.2f}",
                        (10, y_offset + 54),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
-            cv2.putText(frame, f"Smile L/R: {vrcft.get('v2/MouthSmileLeft', 0):.2f}/{vrcft.get('v2/MouthSmileRight', 0):.2f}",
+            cv2.putText(frame, f"Funnel: {vrcft.get('v2/LipFunnel', 0):.2f}  Pucker: {vrcft.get('v2/LipPucker', 0):.2f}",
                        (10, y_offset + 72),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
-            cv2.putText(frame, f"LipFunnel: {vrcft.get('v2/LipFunnel', 0):.2f} Pucker: {vrcft.get('v2/LipPucker', 0):.2f}",
+            cv2.putText(frame, f"Smile: {vrcft.get('v2/MouthSmile', 0):.2f}  Frown: {vrcft.get('v2/MouthFrown', 0):.2f}",
                        (10, y_offset + 90),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"Press: {vrcft.get('v2/MouthPress', 0):.2f} Stretch: {vrcft.get('v2/MouthStretch', 0):.2f} X: {vrcft.get('v2/MouthX', 0):.2f}",
+                       (10, y_offset + 108),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"EyeClosed L: {vrcft.get('v2/EyeClosedLeft', 0):.2f} R: {vrcft.get('v2/EyeClosedRight', 0):.2f}",
+                       (10, y_offset + 126),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1, cv2.LINE_AA)
 
         # 面部变换矩阵数据显示 (参考 mediapipe-vt)
         face_rot = face_data.get("face_rotation", [0, 0, 0])
         face_pos = face_data.get("face_position", [0, 0, 0])
         cv2.putText(frame, f"Face Rot: P={face_rot[0]:.1f} Y={face_rot[1]:.1f} R={face_rot[2]:.1f}",
-                   (10, y_offset + 108),
+                   (10, y_offset + 144),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 255), 1, cv2.LINE_AA)
 
         return frame
@@ -863,4 +1012,8 @@ class FaceLandmarkDetector:
         self.is_loaded = False
         with self._result_lock:
             self._latest_result = None
+            self._latest_result_timestamp = -1
+            self._consumed_result_timestamp = -1
+        self._latest_face_data = None
+        self.last_result_fresh = False
         self._bs_smoothed.clear()

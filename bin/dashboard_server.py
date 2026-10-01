@@ -13,13 +13,14 @@ YOLO26n VRC Mocap Web Dashboard
 import os
 import sys
 import json
+import csv
+import copy
+import math
 import shutil
 import subprocess
 import threading
 import time
-import glob as glob_mod
 from pathlib import Path
-from datetime import datetime
 
 # 尝试导入 psutil 用于进程管理
 try:
@@ -31,28 +32,157 @@ except ImportError:
 from flask import Flask, jsonify, request, send_from_directory
 from typing import Optional
 
+from face_calibration import (
+    FACE_STATE_PATH,
+    default_face_calibration,
+    normalize_face_calibration,
+    read_face_state,
+)
+from runtime_status import mark_tracking_stopped, read_tracking_state
+from edition import edition_info, yolo_available
+from runtime_paths import resource_root, runtime_root
+from streamers.coord import hmd_pose_anchor_trusted
+from vmt_runtime import (
+    VMT_INSTALLER_NAME,
+    download_vmt_installer,
+    find_vmt_manager,
+    get_vmt_runtime_status,
+    launch_elevated,
+    query_openvr_devices,
+    query_vmt_devices,
+    vmt_installer_is_running,
+)
+
 # 项目根目录
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-# 配置文件路径 - 优先使用项目目录，OneDrive 锁定时回退到临时目录
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+PROJECT_ROOT = resource_root()
+RUNTIME_ROOT = runtime_root()
+CONFIG_PATH = RUNTIME_ROOT / "config" / "config.json"
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 STATIC_DIR = Path(__file__).parent / "static"
-DATASETS_DIR = PROJECT_ROOT / "datasets"
+if not STATIC_DIR.exists():
+    STATIC_DIR = PROJECT_ROOT / "bin" / "static"
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 
+_dashboard_runtime = {"host": "127.0.0.1", "port": 8766}
+
 # 全局状态
 mocap_process = None
-mocap_status = {"running": False, "pid": None, "start_time": None}
-train_process = None
-train_status = {"running": False, "pid": None, "start_time": None, "name": None}
+mocap_status = {"running": False, "pid": None, "start_time": None, "starting": False}
 
 # HMD 位姿数据提供者 (独立于动捕进程，由 dashboard 直接管理)
 _hmd_provider = None
 _hmd_lock = threading.Lock()
 
 # 配置文件读写锁，避免 Windows 下多线程读写冲突
-_config_lock = threading.Lock()
+_config_lock = threading.RLock()
+_config_cache_signature = None
+_active_config_path = None
 _config_cache = None  # 内存缓存，避免频繁读文件导致 Windows 文件锁
+_hardware_cache = {"data": None, "ts": 0.0}
+_performance_recommendation_cache = {"data": None, "ts": 0.0}
+_performance_recommendation_lock = threading.Lock()
+_camera_cache = {"data": None, "ts": 0.0}
+_camera_lock = threading.Lock()
+_mocap_process_cache = {"data": [], "ts": 0.0}
+_model_cache = {"data": None, "ts": 0.0, "current": None}
+_inference_status_cache = {"data": None, "ts": 0.0, "signature": None}
+CACHE_TTL_SECONDS = 15.0
+MOCAP_SCAN_TTL_SECONDS = 15.0
+MODEL_CACHE_TTL_SECONDS = 30.0
+INFERENCE_STATUS_TTL_SECONDS = 1.0
+PERFORMANCE_RECOMMENDATION_TTL_SECONDS = 60.0
+LOG_TAIL_BYTES = 256 * 1024
+
+UI_SECTION_IDS = frozenset({
+    "quickSection",
+    "hardwareSection",
+    "bodySection",
+    "faceSection",
+    "handSection",
+    "streamingSection",
+    "hmdSection",
+    "logSection",
+    "modelSection",
+})
+
+PERFORMANCE_TIER_LABELS = {
+    "low": "基础",
+    "medium": "均衡",
+    "high": "高性能",
+    "ultra": "极致",
+}
+
+PERFORMANCE_BASELINES = {
+    "low": {
+        "camera_width": 640,
+        "camera_height": 480,
+        "camera_fps": 24,
+        "precision": "fp32",
+        "confidence": 0.55,
+        "body_max_fps": 12,
+        "face_max_fps": 15,
+        "hand_max_fps": 12,
+        "stability": 80,
+    },
+    "medium": {
+        "camera_width": 960,
+        "camera_height": 540,
+        "camera_fps": 30,
+        "precision": "fp16",
+        "confidence": 0.5,
+        "body_max_fps": 18,
+        "face_max_fps": 24,
+        "hand_max_fps": 18,
+        "stability": 65,
+    },
+    "high": {
+        "camera_width": 1280,
+        "camera_height": 720,
+        "camera_fps": 30,
+        "precision": "fp16",
+        "confidence": 0.5,
+        "body_max_fps": 24,
+        "face_max_fps": 30,
+        "hand_max_fps": 24,
+        "stability": 55,
+    },
+    "ultra": {
+        "camera_width": 1920,
+        "camera_height": 1080,
+        "camera_fps": 30,
+        "precision": "fp16",
+        "confidence": 0.45,
+        "body_max_fps": 30,
+        "face_max_fps": 30,
+        "hand_max_fps": 30,
+        "stability": 45,
+    },
+}
+
+
+def _read_text_tail(path: Path, max_bytes: int = LOG_TAIL_BYTES) -> str:
+    try:
+        size = path.stat().st_size
+        with open(str(path), "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+                data = f.read()
+                first_newline = data.find(b"\n")
+                if first_newline >= 0:
+                    data = data[first_newline + 1:]
+            else:
+                data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _read_log_tail_lines(path: Path, tail: int = 50) -> tuple[str, int]:
+    text = _read_text_tail(path)
+    lines = text.splitlines(True)
+    recent = lines[-tail:] if len(lines) > tail else lines
+    return "".join(recent), len(lines)
 
 
 def kill_stale_mocap_processes() -> int:
@@ -78,11 +208,16 @@ def kill_stale_mocap_processes() -> int:
                 if managed_pid is not None and proc.pid == managed_pid:
                     continue
                 
-                if 'python' not in proc.name().lower() and 'python.exe' not in proc.name().lower():
+                proc_name = proc.name().lower()
+                if (
+                    'python' not in proc_name
+                    and 'python.exe' not in proc_name
+                    and 'yolo26n-vrc-mocap' not in proc_name
+                ):
                     continue
                 
                 cmdline = proc.cmdline()
-                if not any('main.py' in arg for arg in cmdline):
+                if not any('main.py' in arg or '--mocap-child' in arg for arg in cmdline):
                     continue
 
                 if any('dashboard' in arg for arg in cmdline):
@@ -103,67 +238,463 @@ def kill_stale_mocap_processes() -> int:
     return killed_count
 
 
-def load_config() -> dict:
-    global _config_cache
-    with _config_lock:
-        if _config_cache is not None:
-            return _config_cache
-        # 优先从项目目录读取
-        if CONFIG_PATH.exists():
-            try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    _config_cache = json.load(f)
-                    return _config_cache
-            except (OSError, json.JSONDecodeError):
-                pass
-        # 回退到临时目录
-        import tempfile
-        tmp_path = Path(tempfile.gettempdir()) / "vrc-mocap" / "config.json"
-        if tmp_path.exists():
-            try:
-                with open(tmp_path, "r", encoding="utf-8") as f:
-                    _config_cache = json.load(f)
-                    return _config_cache
-            except (OSError, json.JSONDecodeError):
-                pass
-        _config_cache = {}
-        return _config_cache
+def _fallback_config_path() -> Path:
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / "vrc-mocap" / "config.json"
 
 
-def save_config(config: dict):
-    global _config_cache
-    with _config_lock:
-        _config_cache = config
-        content = json.dumps(config, indent=4, ensure_ascii=False)
-        # 尝试写入项目目录（OneDrive 可能释放了锁）
-        saved = False
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _write_config_path(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with open(temporary, "w", encoding="utf-8") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        for delay in (0.005, 0.015, 0.03, 0.06, None):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if delay is None:
+                    raise
+                time.sleep(delay)
+    finally:
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                f.write(content)
-                f.flush()
-                os.fsync(f.fileno())  # 确保数据写入磁盘
-            saved = True
-        except OSError as e:
-            print(f"[WARN] 写入配置文件失败: {e}")
-        # 项目目录不可写时，回退到临时目录
-        if not saved:
-            import tempfile
-            tmp_dir = Path(tempfile.gettempdir()) / "vrc-mocap"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = tmp_dir / "config.json"
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _config_signature(path: Optional[Path]):
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _config_candidates():
+    paths = (CONFIG_PATH, _fallback_config_path(), DEFAULT_CONFIG_PATH)
+    unique = []
+    seen = set()
+    for path in paths:
+        resolved = str(Path(path).resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(Path(path))
+    return unique
+
+
+def _load_config_unlocked() -> dict:
+    global _config_cache, _config_cache_signature, _active_config_path
+    if _config_cache is not None:
+        current_signature = _config_signature(_active_config_path)
+        if current_signature is not None and current_signature == _config_cache_signature:
+            return _config_cache
+
+    runtime_candidates = []
+    for path in (CONFIG_PATH, _fallback_config_path()):
+        path = Path(path)
+        if path.exists() and path not in runtime_candidates:
+            runtime_candidates.append(path)
+    if runtime_candidates:
+        candidates = runtime_candidates
+    else:
+        candidates = [
+            path for path in _config_candidates()
+            if path.exists()
+        ]
+    candidates.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    for candidate in candidates:
+        try:
+            with open(candidate, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if not isinstance(loaded, dict):
+                continue
+            _config_cache = loaded
+            _active_config_path = candidate
+            _config_cache_signature = _config_signature(candidate)
+            return _config_cache
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    _config_cache = {}
+    _active_config_path = CONFIG_PATH
+    _config_cache_signature = None
+    return _config_cache
+
+
+def load_config() -> dict:
+    with _config_lock:
+        return copy.deepcopy(_load_config_unlocked())
+
+
+def active_config_path() -> Path:
+    with _config_lock:
+        _load_config_unlocked()
+        return Path(_active_config_path or CONFIG_PATH)
+
+
+def _deep_merge_config(target: dict, patch: dict) -> dict:
+    """Recursively merge JSON objects; arrays and scalar values replace."""
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge_config(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
+    return target
+
+
+def ensure_face_calibration_config(config: dict) -> dict:
+    face_cfg = config.setdefault("face", {})
+    face_cfg.setdefault("mouth_shape_mapping_enabled", True)
+    face_cfg.setdefault("mouth_shape_gain", 1.25)
+    face_cfg.setdefault("mouth_shape_deadzone", 0.03)
+    face_cfg.setdefault("eyelid_independent_enabled", True)
+    face_cfg.setdefault("eyelid_close_gain", 1.35)
+    face_cfg.setdefault("eyelid_close_deadzone", 0.04)
+    face_cfg.setdefault("eyelid_send_combined", False)
+    face_cfg["vrcft_calibration"] = normalize_face_calibration(
+        face_cfg.get("vrcft_calibration", default_face_calibration())
+    )
+    return face_cfg["vrcft_calibration"]
+
+
+def ensure_processing_config(config: dict) -> dict:
+    processing = config.setdefault("processing", {})
+    processing.setdefault("module_rate_limit_enabled", True)
+    processing.setdefault("reuse_last_result", True)
+    processing.setdefault("parallel_inference_enabled", True)
+    processing.setdefault("body_max_fps", 20)
+    processing.setdefault("hmd_pose_hold_seconds", 5.0)
+    processing.setdefault("hmd_pose_refresh_fps", 15.0)
+    processing.setdefault("face_max_fps", 30)
+    processing.setdefault("hand_max_fps", 20)
+    processing.setdefault("dual_camera_body_enabled", False)
+    processing.setdefault("secondary_body_max_fps", 12)
+    processing.setdefault("dual_camera_fusion_mode", "confidence")
+    processing.setdefault("fusion_confidence_margin", 0.12)
+    processing.setdefault("fusion_min_confidence", 0.15)
+    processing.setdefault("fusion_max_pose_delta", 0.75)
+    return processing
+
+
+def ensure_hand_streaming_config(config: dict) -> dict:
+    hand_streaming = config.setdefault("streaming", {}).setdefault("hand", {})
+    hand_streaming.setdefault("host", config.get("streaming", {}).get("host", "127.0.0.1"))
+    hand_streaming.setdefault("port", config.get("streaming", {}).get("port", 9000))
+    hand_streaming.setdefault("vmt_local_mode", True)
+    if hand_streaming.get("vmt_local_mode", True):
+        hand_streaming["vmt_host"] = "127.0.0.1"
+    else:
+        hand_streaming.setdefault("vmt_host", hand_streaming.get("host", "127.0.0.1"))
+    hand_streaming.setdefault("vmt_port", 39570)
+    hand_streaming.setdefault("streaming_enabled", True)
+    hand_streaming.setdefault("desktop_osc_enabled", True)
+    hand_streaming.setdefault("vmt_enabled", True)
+    hand_streaming.setdefault("vmt_skeleton_enabled", True)
+    hand_streaming.setdefault("vmt_input_enabled", True)
+    hand_streaming.setdefault("vmt_auto_enable_skeleton", True)
+    hand_streaming.setdefault("vmt_register_on_steamvr_startup", True)
+    hand_streaming.setdefault("vmt_keep_controllers_active", True)
+    try:
+        priority = int(hand_streaming.get("vmt_hand_selection_priority", 100))
+    except (TypeError, ValueError):
+        priority = 100
+    hand_streaming["vmt_hand_selection_priority"] = max(0, min(1000, priority))
+    hand_streaming.setdefault("vmt_left_device_index", 1)
+    hand_streaming.setdefault("vmt_right_device_index", 2)
+    hand_streaming.setdefault("custom_parameters_enabled", True)
+    hand_streaming.setdefault("lost_reset_timeout", 0.35)
+    hand_streaming.setdefault("desktop_left_gesture_parameters", [
+        "DynamicGesture/CurrentGestureLeft",
+        "DynamicGesture/CurrentLeftIndex",
+        "MocapGestureLeft",
+    ])
+    hand_streaming.setdefault("desktop_right_gesture_parameters", [
+        "DynamicGesture/CurrentGestureRight",
+        "DynamicGesture/CurrentRightIndex",
+        "MocapGestureRight",
+    ])
+    return hand_streaming
+
+
+def ensure_secondary_camera_config(config: dict) -> dict:
+    secondary = config.setdefault("camera_secondary", {})
+    secondary.setdefault("enabled", False)
+    secondary.setdefault("camera_id", 1)
+    secondary.setdefault("width", config.get("camera", {}).get("width", 640))
+    secondary.setdefault("height", config.get("camera", {}).get("height", 480))
+    secondary.setdefault("fps", config.get("camera", {}).get("fps", 30))
+    secondary.setdefault("flip_horizontal", config.get("camera", {}).get("flip_horizontal", True))
+    secondary.setdefault("zoom", 0)
+    return secondary
+
+
+def ensure_ui_config(config: dict) -> dict:
+    ui = config.get("ui")
+    if not isinstance(ui, dict):
+        ui = {}
+        config["ui"] = ui
+
+    presets = ui.get("quick_presets")
+    if not isinstance(presets, list):
+        presets = []
+
+    normalized = []
+    preset_ids = set()
+    for item in presets[:20]:
+        if not isinstance(item, dict) or not isinstance(item.get("values"), dict):
+            continue
+        preset_id = "".join(
+            char for char in str(item.get("id") or "")
+            if char.isalnum() or char in "-_"
+        )[:64]
+        name = str(item.get("name") or "").strip()[:40]
+        if not preset_id or not name or preset_id in preset_ids:
+            continue
+
+        values = {}
+        for key, value in list(item["values"].items())[:64]:
+            key = str(key)[:64]
+            if not key:
+                continue
+            if isinstance(value, bool):
+                values[key] = value
+            elif isinstance(value, (int, float)) and math.isfinite(value):
+                values[key] = value
+            elif isinstance(value, str):
+                values[key] = value[:128]
+
+        normalized.append({
+            "id": preset_id,
+            "name": name,
+            "values": values,
+            "updated_at": str(item.get("updated_at") or "")[:40],
+        })
+        preset_ids.add(preset_id)
+
+    active = str(ui.get("active_quick_preset") or "manual")[:80]
+    builtin_ids = {
+        "builtin:latency",
+        "builtin:balanced",
+        "builtin:precision",
+        "builtin:stable",
+    }
+    if active.startswith("custom:"):
+        if active[len("custom:"):] not in preset_ids:
+            active = "manual"
+    elif active not in builtin_ids and active != "manual":
+        active = "manual"
+
+    ui["quick_preset_schema"] = 1
+    ui["active_quick_preset"] = active
+    ui["quick_presets"] = normalized
+    active_section = ui.get("active_section")
+    if isinstance(active_section, str):
+        active_section = active_section.strip()
+    if active_section not in UI_SECTION_IDS:
+        active_section = "quickSection"
+    ui["active_section"] = active_section
+    return ui
+
+
+def normalize_body_streaming_config(config: dict):
+    inference_cfg = config.setdefault("body", {})
+    backend = str(inference_cfg.get("inference_backend", "yolo")).strip().lower()
+    if backend in ("mp", "mediapipe", "mediapipepose", "media_pipe_pose"):
+        backend = "mediapipe_pose"
+    if backend not in ("yolo", "mediapipe_pose"):
+        backend = "yolo"
+    if backend == "yolo" and not yolo_available():
+        backend = "mediapipe_pose"
+    inference_cfg["inference_backend"] = backend
+    if backend == "mediapipe_pose":
+        inference_cfg["enabled"] = True
+        for key in (
+            "detect_torso",
+            "detect_left_arm",
+            "detect_right_arm",
+            "detect_left_leg",
+            "detect_right_leg",
+        ):
+            inference_cfg.setdefault(key, True)
+        config.setdefault("mediapipe_pose", {})["enabled"] = True
+    streaming_cfg = config.setdefault("streaming", {})
+    body_cfg = streaming_cfg.setdefault("body", {})
+    body_streaming_requested = body_cfg.get("streaming_enabled")
+    body_cfg.setdefault("streaming_enabled", True)
+    if body_streaming_requested is True:
+        inference_cfg["enabled"] = True
+    if config.get("processing", {}).get("dual_camera_body_enabled") is True:
+        inference_cfg["enabled"] = True
+    # ``streaming.body`` is the runtime source of truth. Older configurations
+    # stored these switches only under ``vrc``; inherit them before applying
+    # defaults so loading an old file cannot silently change body behavior.
+    vrc_cfg = config.setdefault("vrc", {})
+    for key, default in (
+        ("host", "127.0.0.1"),
+        ("port", 9000),
+        ("protocol", "osc"),
+        ("decouple_from_hmd", False),
+        ("send_position", True),
+        ("send_rotation", True),
+        ("send_head_position", False),
+    ):
+        if key not in body_cfg and key in vrc_cfg:
+            body_cfg[key] = vrc_cfg[key]
+        body_cfg.setdefault(key, default)
+    if "tracker_toggles" not in body_cfg and isinstance(vrc_cfg.get("tracker_toggles"), dict):
+        body_cfg["tracker_toggles"] = dict(vrc_cfg["tracker_toggles"])
+    if "hmd_height_scaling" not in body_cfg and isinstance(vrc_cfg.get("hmd_height_scaling"), dict):
+        body_cfg["hmd_height_scaling"] = dict(vrc_cfg["hmd_height_scaling"])
+    body_cfg.setdefault("hmd_height_scaling", {})
+    hmd_height_scaling = body_cfg["hmd_height_scaling"]
+    if not isinstance(hmd_height_scaling, dict):
+        hmd_height_scaling = {}
+        body_cfg["hmd_height_scaling"] = hmd_height_scaling
+    hmd_height_scaling.setdefault("enabled", True)
+    hmd_height_scaling.setdefault("floor_clearance", 0.03)
+    hmd_height_scaling.setdefault("min_hmd_y", 0.35)
+    hmd_height_scaling.setdefault("min_body_scale", 0.45)
+    hmd_height_scaling.setdefault("max_body_scale", 1.0)
+    hmd_height_scaling.setdefault("vertical_only", True)
+    hmd_height_scaling.setdefault("require_actual_height", True)
+    hmd_height_scaling.setdefault("crouch_from_hmd_height", True)
+    hmd_height_scaling.setdefault("standing_eye_height", 1.65)
+    hmd_height_scaling.setdefault("standing_eye_height_calibrated", False)
+    hmd_height_scaling.setdefault("auto_learn_standing_height", True)
+    hmd_height_scaling.setdefault("auto_learn_allow_downward", True)
+    hmd_height_scaling.setdefault("auto_learn_downward_max_delta", 0.25)
+    hmd_height_scaling.setdefault("auto_learn_standing_pose_threshold", 0.8)
+    hmd_height_scaling.setdefault("min_standing_eye_height", 1.2)
+    hmd_height_scaling.setdefault("max_standing_eye_height", 2.2)
+    hmd_height_scaling.setdefault("auto_learn_min_height", 1.2)
+    hmd_height_scaling.setdefault("auto_learn_window", 20)
+    hmd_height_scaling.setdefault("auto_learn_stability_tolerance", 0.03)
+    hmd_height_scaling.setdefault("crouch_start_ratio", 0.92)
+    hmd_height_scaling.setdefault("seated_ratio", 0.55)
+    hmd_height_scaling.setdefault("seated_eye_height", 0.95)
+    hmd_height_scaling.setdefault("seated_hip_height", 0.45)
+    hmd_height_scaling.setdefault("standing_hip_min_height", 0.78)
+    hmd_height_scaling.setdefault("standing_chest_min_height", 1.05)
+    hmd_height_scaling.setdefault("foot_grounding_enabled", True)
+    hmd_height_scaling.setdefault("auto_calibrate_foot_reference", True)
+    hmd_height_scaling.setdefault("foot_calibration_samples", 15)
+    hmd_height_scaling.setdefault("foot_lift_gain", 1.0)
+    hmd_height_scaling.setdefault("max_foot_lift", 0.35)
+    hmd_height_scaling.setdefault("crouch_knee_forward", 0.18)
+    hmd_height_scaling.setdefault("crouch_knee_outward", 0.06)
+    if not body_cfg.get("send_position", True):
+        body_cfg["send_head_position"] = False
+    else:
+        body_cfg["send_head_position"] = bool(body_cfg.get("send_head_position", False))
+
+    # Keep the legacy ``vrc`` mirror exact. The body streamer reads only
+    # ``streaming.body``, while older UI/scripts still read ``vrc``.
+    vrc_cfg["decouple_from_hmd"] = body_cfg.get("decouple_from_hmd", False)
+    vrc_cfg["send_position"] = body_cfg.get("send_position", True)
+    vrc_cfg["send_rotation"] = body_cfg.get("send_rotation", True)
+    vrc_cfg["send_head_position"] = body_cfg.get("send_head_position", False)
+    vrc_cfg["hmd_height_scaling"] = body_cfg.get("hmd_height_scaling", {})
+    if "tracker_toggles" in body_cfg:
+        vrc_cfg["tracker_toggles"] = body_cfg["tracker_toggles"]
+
+
+def _body_height_scaling_config(config: dict) -> dict:
+    streaming_body = config.setdefault("streaming", {}).setdefault("body", {})
+    scaling = streaming_body.setdefault("hmd_height_scaling", {})
+    if not isinstance(scaling, dict):
+        scaling = {}
+        streaming_body["hmd_height_scaling"] = scaling
+    return scaling
+
+
+def _height_posture_state(actual_height, hmd_height_scaling: dict) -> dict:
+    try:
+        height = float(actual_height)
+    except (TypeError, ValueError):
+        return {
+            "actual_height": None,
+            "standing_eye_height": hmd_height_scaling.get("standing_eye_height", 1.65),
+            "height_ratio": None,
+            "posture": "unknown",
+            "reason": "missing_actual_height",
+        }
+    standing = float(hmd_height_scaling.get("standing_eye_height", 1.65) or 1.65)
+    if standing <= 0:
+        standing = 1.65
+    ratio = height / standing
+    crouch_start = float(hmd_height_scaling.get("crouch_start_ratio", 0.92) or 0.92)
+    seated_ratio = float(hmd_height_scaling.get("seated_ratio", 0.55) or 0.55)
+    seated_height = float(hmd_height_scaling.get("seated_eye_height", 0.95) or 0.95)
+    if height <= seated_height or ratio <= seated_ratio:
+        posture = "seated"
+    elif ratio < crouch_start:
+        posture = "crouch"
+    else:
+        posture = "standing"
+    return {
+        "actual_height": height,
+        "standing_eye_height": standing,
+        "height_ratio": ratio,
+        "posture": posture,
+        "reason": "ok",
+    }
+
+
+def save_config(config: dict) -> Path:
+    global _config_cache, _config_cache_signature, _active_config_path
+    with _config_lock:
+        snapshot = copy.deepcopy(config)
+        content = json.dumps(
+            snapshot,
+            indent=4,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        errors = []
+        fallback_path = _fallback_config_path()
+        paths = []
+        for path in (CONFIG_PATH, fallback_path):
+            path = Path(path)
+            if path not in paths:
+                paths.append(path)
+        for path in paths:
             try:
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                    f.flush()
-                print(f"[INFO] 配置已保存到 {tmp_path}（项目目录被 OneDrive 锁定）")
-            except OSError as e:
-                print(f"[WARN] 无法写入配置文件: {e}，配置仅保存在内存中")
+                _write_config_path(path, content)
+            except OSError as exc:
+                errors.append((path, exc))
+                print(f"[WARN] Config write failed at {path}: {exc}")
+                continue
+
+            _config_cache = json.loads(content)
+            _active_config_path = path
+            _config_cache_signature = _config_signature(path)
+            if path != CONFIG_PATH:
+                print(f"[INFO] Config saved to fallback path: {path}")
+            return path
+
+        details = "; ".join(f"{path}: {exc}" for path, exc in errors)
+        raise OSError(f"Unable to persist configuration ({details})")
 
 
 def detect_hardware() -> dict:
     """检测可用硬件"""
     devices = [{"id": "cpu", "name": "CPU", "available": True}]
+    if not yolo_available():
+        # Lite edition: MediaPipe picks its own delegate; no torch to query.
+        return {
+            "devices": devices,
+            "current": load_config().get("yolo", {}).get("device", "auto"),
+            "edition": "lite",
+        }
 
     try:
         import torch
@@ -185,6 +716,252 @@ def detect_hardware() -> dict:
     return {"devices": devices, "current": load_config().get("yolo", {}).get("device", "auto")}
 
 
+def _positive_number(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def _normalized_performance_basis(basis: dict) -> dict:
+    basis = basis if isinstance(basis, dict) else {}
+    gpu_name = basis.get("gpu_name")
+    gpu_name = str(gpu_name).strip() if gpu_name else None
+
+    def normalized_count(key):
+        value = _positive_number(basis.get(key))
+        return int(value) if value is not None else None
+
+    def normalized_gb(key):
+        value = _positive_number(basis.get(key))
+        return round(value, 1) if value is not None else None
+
+    device = str(basis.get("device") or "").strip()
+    if not device:
+        device = "cuda:0" if gpu_name else "cpu"
+    return {
+        "device": device,
+        "gpu_name": gpu_name,
+        "gpu_memory_gb": normalized_gb("gpu_memory_gb"),
+        "cpu_physical_cores": normalized_count("cpu_physical_cores"),
+        "cpu_logical_cores": normalized_count("cpu_logical_cores"),
+        "memory_gb": normalized_gb("memory_gb"),
+    }
+
+
+def _detect_loaded_torch_gpu():
+    torch_module = sys.modules.get("torch")
+    if torch_module is None:
+        return None
+    try:
+        cuda = torch_module.cuda
+        if not cuda.is_available():
+            return None
+        best = None
+        for index in range(int(cuda.device_count())):
+            memory_bytes = _positive_number(cuda.get_device_properties(index).total_memory)
+            memory_gb = memory_bytes / (1024 ** 3) if memory_bytes is not None else None
+            candidate = {
+                "device": f"cuda:{index}",
+                "gpu_name": str(cuda.get_device_name(index)).strip() or None,
+                "gpu_memory_gb": memory_gb,
+            }
+            if best is None or (candidate["gpu_memory_gb"] or 0) > (best["gpu_memory_gb"] or 0):
+                best = candidate
+        return best
+    except Exception:
+        return None
+
+
+def _detect_nvidia_smi_gpu():
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return None
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "--query-gpu=index,name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            **kwargs,
+        )
+        if result.returncode != 0:
+            return None
+        best = None
+        for row in csv.reader(result.stdout.splitlines()):
+            if len(row) < 3:
+                continue
+            index = int(row[0].strip())
+            memory_mb = _positive_number(row[2])
+            candidate = {
+                "device": f"cuda:{index}",
+                "gpu_name": row[1].strip() or None,
+                "gpu_memory_gb": memory_mb / 1024 if memory_mb is not None else None,
+            }
+            if best is None or (candidate["gpu_memory_gb"] or 0) > (best["gpu_memory_gb"] or 0):
+                best = candidate
+        return best
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return None
+
+
+def _fallback_total_memory_gb():
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("length", ctypes.c_ulong),
+                    ("memory_load", ctypes.c_ulong),
+                    ("total_physical", ctypes.c_ulonglong),
+                    ("available_physical", ctypes.c_ulonglong),
+                    ("total_page_file", ctypes.c_ulonglong),
+                    ("available_page_file", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong),
+                    ("available_virtual", ctypes.c_ulonglong),
+                    ("available_extended_virtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return status.total_physical / (1024 ** 3)
+            return None
+
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        page_count = os.sysconf("SC_PHYS_PAGES")
+        return (page_size * page_count) / (1024 ** 3)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def collect_performance_basis() -> dict:
+    physical_cores = None
+    logical_cores = None
+    memory_gb = None
+    try:
+        logical_cores = os.cpu_count()
+    except Exception:
+        pass
+
+    if HAS_PSUTIL:
+        try:
+            physical_cores = psutil.cpu_count(logical=False)
+            logical_cores = psutil.cpu_count(logical=True) or logical_cores
+        except Exception:
+            pass
+        try:
+            memory_gb = psutil.virtual_memory().total / (1024 ** 3)
+        except Exception:
+            pass
+    if memory_gb is None:
+        try:
+            memory_gb = _fallback_total_memory_gb()
+        except Exception:
+            memory_gb = None
+
+    gpu = _detect_loaded_torch_gpu() or _detect_nvidia_smi_gpu() or {}
+    return _normalized_performance_basis({
+        "device": gpu.get("device", "cpu"),
+        "gpu_name": gpu.get("gpu_name"),
+        "gpu_memory_gb": gpu.get("gpu_memory_gb"),
+        "cpu_physical_cores": physical_cores,
+        "cpu_logical_cores": logical_cores,
+        "memory_gb": memory_gb,
+    })
+
+
+def classify_performance_tier(basis: dict) -> str:
+    basis = _normalized_performance_basis(basis)
+    gpu_memory = basis["gpu_memory_gb"]
+    has_gpu = bool(basis["gpu_name"] or gpu_memory)
+
+    gpu_level = None
+    if has_gpu:
+        if gpu_memory is None:
+            gpu_level = 1
+        elif gpu_memory >= 10:
+            gpu_level = 3
+        elif gpu_memory >= 5.5:
+            gpu_level = 2
+        elif gpu_memory >= 3.5:
+            gpu_level = 1
+        else:
+            gpu_level = 0
+
+    cpu_levels = []
+    physical = basis["cpu_physical_cores"]
+    logical = basis["cpu_logical_cores"]
+    if physical is not None:
+        cpu_levels.append(3 if physical >= 12 else 2 if physical >= 6 else 1 if physical >= 4 else 0)
+    if logical is not None:
+        cpu_levels.append(3 if logical >= 24 else 2 if logical >= 12 else 1 if logical >= 8 else 0)
+    cpu_level = max(cpu_levels) if cpu_levels else None
+
+    memory = basis["memory_gb"]
+    memory_level = None
+    if memory is not None:
+        memory_level = 3 if memory >= 28 else 2 if memory >= 12 else 1 if memory >= 7 else 0
+
+    known_levels = [level for level in (gpu_level, cpu_level, memory_level) if level is not None]
+    if not known_levels:
+        return "low"
+    overall_level = min(known_levels)
+    if not has_gpu:
+        overall_level = min(overall_level, 1)
+    return ("low", "medium", "high", "ultra")[overall_level]
+
+
+def build_performance_recommendation(basis: dict) -> dict:
+    basis = _normalized_performance_basis(basis)
+    tier = classify_performance_tier(basis)
+    baseline = copy.deepcopy(PERFORMANCE_BASELINES[tier])
+    if basis["device"] == "cpu":
+        baseline["precision"] = "fp32"
+
+    if basis["gpu_name"]:
+        gpu_detail = basis["gpu_name"]
+        if basis["gpu_memory_gb"] is not None:
+            gpu_detail += f" ({basis['gpu_memory_gb']:.1f} GB 显存)"
+    else:
+        gpu_detail = "未检测到可用独立 GPU"
+    cpu_detail = "CPU 核心数未知"
+    if basis["cpu_physical_cores"] is not None or basis["cpu_logical_cores"] is not None:
+        cpu_detail = (
+            f"CPU {basis['cpu_physical_cores'] or '?'} 个物理核心 / "
+            f"{basis['cpu_logical_cores'] or '?'} 个逻辑核心"
+        )
+    memory_detail = (
+        f"内存 {basis['memory_gb']:.1f} GB"
+        if basis["memory_gb"] is not None
+        else "内存容量未知"
+    )
+    rationale = f"{gpu_detail}；{cpu_detail}；{memory_detail}。按已知关键资源的保守档位给出建议。"
+    return {
+        "status": "ok",
+        "tier": tier,
+        "tier_label": PERFORMANCE_TIER_LABELS[tier],
+        "basis": basis,
+        "baseline": baseline,
+        "rationale": rationale,
+    }
+
+
 # ============ API 路由 ============
 
 @app.route("/")
@@ -198,43 +975,163 @@ def index():
     return resp
 
 
+@app.route("/api/edition", methods=["GET"])
+def get_edition():
+    return jsonify(edition_info())
+
+
 @app.route("/api/config", methods=["GET"])
 def get_config():
-    return jsonify(load_config())
+    config = load_config()
+    ensure_secondary_camera_config(config)
+    ensure_processing_config(config)
+    ensure_hand_streaming_config(config)
+    ensure_face_calibration_config(config)
+    ensure_ui_config(config)
+    normalize_body_streaming_config(config)
+    return jsonify(config)
 
 
 @app.route("/api/config", methods=["POST"])
 def update_config():
     try:
         data = request.json
-        config = load_config()
+        if not isinstance(data, dict):
+            return jsonify({"status": "error", "message": "JSON object required"}), 400
 
-        # 记录关键开关变更
-        old_body = config.get("body", {}).get("enabled", True)
-        old_face = config.get("face", {}).get("enabled", True)
-        old_hand = config.get("hand", {}).get("enabled", True)
+        with _config_lock:
+            config = load_config()
 
-        # 深度合并
-        for section, values in data.items():
-            if section in config and isinstance(config[section], dict):
-                config[section].update(values)
-            else:
-                config[section] = values
+            # Keep read, recursive merge, normalization, and write atomic so
+            # autosave requests cannot overwrite unrelated nested settings.
+            old_body = config.get("body", {}).get("enabled", True)
+            old_face = config.get("face", {}).get("enabled", True)
+            old_hand = config.get("hand", {}).get("enabled", True)
 
-        new_body = config.get("body", {}).get("enabled", True)
-        new_face = config.get("face", {}).get("enabled", True)
-        new_hand = config.get("hand", {}).get("enabled", True)
+            _deep_merge_config(config, data)
+            ensure_face_calibration_config(config)
+            ensure_secondary_camera_config(config)
+            ensure_processing_config(config)
+            ensure_hand_streaming_config(config)
+            ensure_ui_config(config)
+            normalize_body_streaming_config(config)
 
-        if old_body != new_body or old_face != new_face or old_hand != new_hand:
-            print(f"[Config] 开关变更: body={old_body}->{new_body}, face={old_face}->{new_face}, hand={old_hand}->{new_hand}")
+            new_body = config.get("body", {}).get("enabled", True)
+            new_face = config.get("face", {}).get("enabled", True)
+            new_hand = config.get("hand", {}).get("enabled", True)
 
-        save_config(config)
-        # 即使文件写入失败，内存缓存已更新，仍返回成功
-        return jsonify({"status": "ok", "config": load_config()})
+            if old_body != new_body or old_face != new_face or old_hand != new_hand:
+                print(f"[Config] 开关变更: body={old_body}->{new_body}, face={old_face}->{new_face}, hand={old_hand}->{new_hand}")
+
+            saved_path = save_config(config)
+        return jsonify({
+            "status": "ok",
+            "config": load_config(),
+            "config_path": str(saved_path),
+            "fallback": saved_path != CONFIG_PATH,
+        })
+    except OSError as e:
+        print(f"[ERROR] update_config persistence failed: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 507
     except Exception as e:
         print(f"[ERROR] update_config: {e}")
         import traceback; traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def _read_latest_face_state(max_age_seconds: float = 5.0) -> dict:
+    if not FACE_STATE_PATH.exists():
+        return {"available": False, "reason": "no_state_file"}
+    try:
+        state = read_face_state(FACE_STATE_PATH)
+    except Exception as e:
+        return {"available": False, "reason": f"read_error: {e}"}
+
+    ts = float(state.get("timestamp") or 0)
+    age = time.time() - ts if ts > 0 else None
+    values = state.get("vrcft_raw", {})
+    available = bool(values) and age is not None and age <= max_age_seconds
+    return {
+        "available": available,
+        "timestamp": ts,
+        "age_seconds": age,
+        "param_count": len(values),
+        "vrcft_raw": values,
+        "reason": None if available else "stale_or_empty",
+    }
+
+
+@app.route("/api/face/calibration", methods=["GET"])
+def face_calibration_status():
+    config = load_config()
+    calibration = ensure_face_calibration_config(config)
+    face_state = _read_latest_face_state()
+    return jsonify({
+        "status": "ok",
+        "enabled": calibration.get("enabled", False),
+        "min_count": len(calibration.get("min_values", {})),
+        "max_count": len(calibration.get("max_values", {})),
+        "updated_at": calibration.get("updated_at"),
+        "state_available": face_state.get("available", False),
+        "state_age_seconds": face_state.get("age_seconds"),
+        "state_param_count": face_state.get("param_count", 0),
+    })
+
+
+@app.route("/api/face/calibration/record", methods=["POST"])
+def face_calibration_record():
+    data = request.json or {}
+    record_type = data.get("type")
+    if record_type not in ("min", "max"):
+        return jsonify({"status": "error", "message": "type must be min or max"}), 400
+
+    state = _read_latest_face_state()
+    if not state.get("available"):
+        return jsonify({
+            "status": "error",
+            "message": "没有可用的实时面部 VRCFT 数据，请启动动捕并确保面部识别正常。",
+            "reason": state.get("reason"),
+        }), 400
+
+    values = {
+        name: float(value)
+        for name, value in state.get("vrcft_raw", {}).items()
+        if name.startswith("v2/")
+    }
+    if not values:
+        return jsonify({"status": "error", "message": "当前面部数据没有 v2/* 参数。"}), 400
+
+    with _config_lock:
+        config = load_config()
+        calibration = ensure_face_calibration_config(config)
+        key = "min_values" if record_type == "min" else "max_values"
+        calibration[key] = values
+        calibration["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_config(config)
+
+    return jsonify({
+        "status": "ok",
+        "type": record_type,
+        "recorded_count": len(values),
+        "enabled": calibration.get("enabled", False),
+        "updated_at": calibration["updated_at"],
+    })
+
+
+@app.route("/api/face/calibration/reset", methods=["POST"])
+def face_calibration_reset():
+    with _config_lock:
+        config = load_config()
+        calibration = ensure_face_calibration_config(config)
+        calibration["min_values"] = {}
+        calibration["max_values"] = {}
+        calibration["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_config(config)
+    return jsonify({
+        "status": "ok",
+        "enabled": calibration.get("enabled", False),
+        "updated_at": calibration["updated_at"],
+    })
 
 
 def detect_cameras() -> list:
@@ -273,6 +1170,14 @@ def detect_cameras() -> list:
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     fps = cap.get(cv2.CAP_PROP_FPS)
+                    zoom = 0.0
+                    zoom_supported = False
+                    if hasattr(cv2, "CAP_PROP_ZOOM"):
+                        try:
+                            zoom = float(cap.get(cv2.CAP_PROP_ZOOM) or 0.0)
+                            zoom_supported = zoom > 0
+                        except Exception:
+                            zoom = 0.0
                     result_list.append({
                         "id": idx,
                         "name": f"摄像头 {idx}",
@@ -280,6 +1185,8 @@ def detect_cameras() -> list:
                         "height": h,
                         "fps": fps if fps and fps > 0 else 30,
                         "backend": backend_name,
+                        "zoom": zoom,
+                        "zoom_supported": zoom_supported,
                     })
         except Exception:
             pass
@@ -307,7 +1214,6 @@ def detect_cameras() -> list:
 
             if result_container:
                 cam = result_container[0]
-                cam["id"] = len(cameras)  # 重编号为连续 ID
                 # 尝试用 DirectShow 获取设备名
                 try:
                     cam["name"] = _get_camera_name_dshow(i) or cam["name"]
@@ -325,6 +1231,11 @@ def detect_cameras() -> list:
                 # 超时，跳过此索引
                 pass
 
+        # Camera indices are backend-specific. Once DirectShow succeeds, keep
+        # that index space so the runtime can open the same physical devices.
+        if cameras:
+            break
+
     # 阶段 2: 如果 DirectShow 没找到，尝试 MSMF 和默认后端
     if not cameras:
         for i in range(10):
@@ -339,7 +1250,6 @@ def detect_cameras() -> list:
 
             if result_container:
                 cam = result_container[0]
-                cam["id"] = len(cameras)
                 cameras.append(cam)
 
     return cameras
@@ -402,15 +1312,91 @@ def _get_camera_name_dshow(index: int) -> Optional[str]:
 
 @app.route("/api/cameras", methods=["GET"])
 def get_cameras():
-    """获取可用摄像头列表"""
-    cams = detect_cameras()
-    current_id = load_config().get("camera", {}).get("camera_id", 0)
-    return jsonify({"cameras": cams, "current": current_id})
+    """Get available cameras."""
+    global _camera_cache
+    config = load_config()
+    current_id = config.get("camera", {}).get("camera_id", 0)
+    force_refresh = request.args.get("refresh", "0").lower() in ("1", "true", "yes")
+    now = time.time()
+
+    def busy_response():
+        cached = _camera_cache.get("data")
+        if cached is not None:
+            return jsonify({"cameras": cached, "current": current_id, "cached": True, "busy": True})
+        cam_cfg = config.get("camera", {})
+        fallback = [{
+            "id": current_id,
+            "name": f"Current camera {current_id} (in use)",
+            "width": cam_cfg.get("width", 640),
+            "height": cam_cfg.get("height", 480),
+            "fps": cam_cfg.get("fps", 30),
+            "backend": "configured",
+        }]
+        return jsonify({"cameras": fallback, "current": current_id, "cached": False, "busy": True})
+
+    mocap_running = bool(mocap_process and mocap_process.poll() is None)
+    if not mocap_running:
+        mocap_running = bool(_find_mocap_processes())
+    if mocap_running:
+        return busy_response()
+
+    if (
+        not force_refresh
+        and _camera_cache.get("data") is not None
+        and now - _camera_cache.get("ts", 0.0) < CACHE_TTL_SECONDS
+    ):
+        return jsonify({"cameras": _camera_cache["data"], "current": current_id, "cached": True})
+
+    if not _camera_lock.acquire(blocking=False):
+        return busy_response()
+    try:
+        now = time.time()
+        if (
+            not force_refresh
+            and _camera_cache.get("data") is not None
+            and now - _camera_cache.get("ts", 0.0) < CACHE_TTL_SECONDS
+        ):
+            return jsonify({"cameras": _camera_cache["data"], "current": current_id, "cached": True})
+        cams = detect_cameras()
+        _camera_cache = {"data": cams, "ts": time.time()}
+        return jsonify({"cameras": cams, "current": current_id, "cached": False})
+    finally:
+        _camera_lock.release()
 
 
 @app.route("/api/hardware", methods=["GET"])
 def get_hardware():
-    return jsonify(detect_hardware())
+    global _hardware_cache
+    now = time.time()
+    if _hardware_cache.get("data") is not None and now - _hardware_cache.get("ts", 0.0) < CACHE_TTL_SECONDS:
+        return jsonify({**_hardware_cache["data"], "cached": True})
+    if mocap_process and mocap_process.poll() is not None:
+        mocap_status["running"] = False
+    if mocap_process and mocap_process.poll() is None:
+        current = load_config().get("yolo", {}).get("device", "auto")
+        devices = [{"id": "cpu", "name": "CPU", "available": True}]
+        if current not in ("auto", "cpu"):
+            devices.append({"id": current, "name": f"{current} (in use)", "available": True})
+        return jsonify({"devices": devices, "current": current, "cached": False, "busy": True})
+    data = detect_hardware()
+    _hardware_cache = {"data": data, "ts": now}
+    return jsonify({**data, "cached": False})
+
+
+@app.route("/api/performance/recommendation", methods=["GET"])
+def performance_recommendation():
+    global _performance_recommendation_cache
+    now = time.monotonic()
+    with _performance_recommendation_lock:
+        cached = _performance_recommendation_cache
+        if cached.get("data") is not None and now - cached.get("ts", 0.0) < PERFORMANCE_RECOMMENDATION_TTL_SECONDS:
+            return jsonify(copy.deepcopy(cached["data"]))
+        try:
+            data = build_performance_recommendation(collect_performance_basis())
+        except Exception:
+            data = build_performance_recommendation({"device": "cpu"})
+        _performance_recommendation_cache = {"data": data, "ts": time.monotonic()}
+        return jsonify(copy.deepcopy(data))
 
 
 @app.route("/api/steamvr/status", methods=["GET"])
@@ -477,6 +1463,14 @@ def steamvr_status():
         except (FileNotFoundError, OSError):
             pass
 
+    config = load_config()
+    hand_cfg = ensure_hand_streaming_config(config)
+    vmt_status_data = get_vmt_runtime_status(
+        host=hand_cfg.get("vmt_host", "127.0.0.1"),
+        port=hand_cfg.get("vmt_port", 39570),
+        project_root=PROJECT_ROOT,
+    )
+
     return jsonify({
         "driver_files_available": driver_installed,
         "driver_installed_to_steamvr": steamvr_driver_installed,
@@ -485,7 +1479,255 @@ def steamvr_status():
         "steamvr_running": pipe_available,
         "num_trackers_registered": num_trackers,
         "driver_version": driver_version,
+        "vmt": vmt_status_data,
     })
+
+
+@app.route("/api/vmt/status", methods=["GET"])
+def vmt_status():
+    config = load_config()
+    hand_cfg = ensure_hand_streaming_config(config)
+    return jsonify(get_vmt_runtime_status(
+        host=hand_cfg.get("vmt_host", "127.0.0.1"),
+        port=hand_cfg.get("vmt_port", 39570),
+        project_root=PROJECT_ROOT,
+    ))
+
+
+@app.route("/api/vmt/devices", methods=["POST"])
+def vmt_devices():
+    """Merge VMT's device table with SteamVR's actual controller selection."""
+    config = load_config()
+    hand_cfg = ensure_hand_streaming_config(config)
+    vmt_host = hand_cfg.get("vmt_host", "127.0.0.1")
+    vmt_port = hand_cfg.get("vmt_port", 39570)
+    result = query_vmt_devices(
+        host=vmt_host,
+        port=vmt_port,
+    )
+    openvr_result = query_openvr_devices()
+    runtime_status = get_vmt_runtime_status(
+        host=vmt_host,
+        port=vmt_port,
+        project_root=PROJECT_ROOT,
+    )
+    expected_serials = [
+        f"VMT_{int(hand_cfg.get('vmt_left_device_index', 1))}",
+        f"VMT_{int(hand_cfg.get('vmt_right_device_index', 2))}",
+    ]
+    openvr_by_serial = {
+        str(item.get("serial")): item
+        for item in openvr_result.get("devices", [])
+        if item.get("serial")
+    }
+
+    result["devices"] = [
+        {**item, **openvr_by_serial.get(str(item.get("serial") or ""), {})}
+        for item in result.get("devices", [])
+    ]
+    merged_vmt_by_serial = {
+        str(item.get("serial")): dict(item)
+        for item in result.get("vmt_devices", [])
+        if item.get("serial")
+    }
+    for serial, item in openvr_by_serial.items():
+        if not item.get("is_vmt"):
+            continue
+        merged_vmt_by_serial[serial] = {
+            **merged_vmt_by_serial.get(serial, {}),
+            **item,
+        }
+    result["vmt_devices"] = list(merged_vmt_by_serial.values())
+
+    present_serials = set(merged_vmt_by_serial)
+    missing_serials = [
+        serial for serial in expected_serials if serial not in present_serials
+    ]
+    expected_devices = []
+    for side, serial in zip(("left", "right"), expected_serials):
+        expected_devices.append({
+            "side": side,
+            "serial": serial,
+            **openvr_by_serial.get(serial, {}),
+        })
+
+    selected_as_left = openvr_result.get("left_serial") == expected_serials[0]
+    selected_as_right = openvr_result.get("right_serial") == expected_serials[1]
+    pose_valid = {
+        item["side"]: bool(item.get("pose_valid"))
+        for item in expected_devices
+    }
+    configured_priority = int(
+        hand_cfg.get("vmt_hand_selection_priority", 100)
+    )
+    priority_mismatches = [
+        {
+            "side": item["side"],
+            "serial": item["serial"],
+            "configured": configured_priority,
+            "active": item.get("hand_selection_priority"),
+        }
+        for item in expected_devices
+        if item.get("hand_selection_priority") is not None
+        and int(item["hand_selection_priority"]) != configured_priority
+    ]
+    register_on_startup = hand_cfg.get(
+        "vmt_register_on_steamvr_startup", True
+    ) is not False
+    driver_register_on_startup = runtime_status.get(
+        "add_compatible_controller_on_startup"
+    )
+    startup_setting_mismatch = (
+        driver_register_on_startup is not None
+        and driver_register_on_startup != register_on_startup
+    )
+    restart_required = bool(startup_setting_mismatch or priority_mismatches)
+
+    blockers = []
+    if not openvr_result.get("ok"):
+        blockers.append({
+            "code": "openvr_unavailable",
+            "message": openvr_result.get("error") or "OpenVR diagnostics unavailable",
+            "restart_required": False,
+        })
+    if missing_serials:
+        blockers.append({
+            "code": "expected_devices_missing",
+            "message": "SteamVR is missing: " + ", ".join(missing_serials),
+            "restart_required": False,
+        })
+    if runtime_status.get("skeleton_input") is False:
+        blockers.append({
+            "code": "skeleton_input_disabled",
+            "message": "VMT SkeletonInput is disabled",
+            "restart_required": False,
+        })
+    if startup_setting_mismatch:
+        blockers.append({
+            "code": "startup_registration_mismatch",
+            "message": (
+                "VMT startup compatible-controller registration does not "
+                "match the project setting"
+            ),
+            "restart_required": True,
+        })
+    if priority_mismatches:
+        blockers.append({
+            "code": "active_priority_stale",
+            "message": "Active OpenVR controller priority differs from configuration",
+            "restart_required": True,
+        })
+    if openvr_result.get("ok") and not selected_as_left:
+        blockers.append({
+            "code": "left_not_selected",
+            "message": f"SteamVR left hand is not {expected_serials[0]}",
+            "restart_required": False,
+        })
+    if openvr_result.get("ok") and not selected_as_right:
+        blockers.append({
+            "code": "right_not_selected",
+            "message": f"SteamVR right hand is not {expected_serials[1]}",
+            "restart_required": False,
+        })
+    for item in expected_devices:
+        if item.get("openvr_index") is not None and not item.get("pose_valid"):
+            blockers.append({
+                "code": f"{item['side']}_pose_invalid",
+                "message": (
+                    f"{item['serial']} pose is invalid; keep the HMD tracked "
+                    "and verify the VMT pose reference"
+                ),
+                "restart_required": False,
+            })
+
+    steamvr_selection_confirmed = bool(
+        openvr_result.get("ok") and selected_as_left and selected_as_right
+    )
+    expected_devices_present = bool(not missing_serials and present_serials)
+    takeover_ready = bool(
+        expected_devices_present
+        and steamvr_selection_confirmed
+        and all(pose_valid.values())
+        and runtime_status.get("skeleton_input") is not False
+        and not restart_required
+    )
+    result.update({
+        "expected_serials": expected_serials,
+        "expected_devices": expected_devices,
+        "missing_serials": missing_serials,
+        "expected_devices_present": expected_devices_present,
+        "selected_as_left": selected_as_left,
+        "selected_as_right": selected_as_right,
+        "pose_valid": pose_valid,
+        "steamvr_controller_selection_confirmed": steamvr_selection_confirmed,
+        "controller_takeover_ready": takeover_ready,
+        "configured_hand_selection_priority": configured_priority,
+        "priority_mismatches": priority_mismatches,
+        "register_on_steamvr_startup": register_on_startup,
+        "driver_register_on_steamvr_startup": driver_register_on_startup,
+        "restart_required": restart_required,
+        "restart_recommended": bool(
+            restart_required
+            or (openvr_result.get("ok") and not steamvr_selection_confirmed)
+        ),
+        "blockers": blockers,
+        "blocking_reasons": [item["message"] for item in blockers],
+        "openvr": openvr_result,
+        "runtime": runtime_status,
+        "vrchat_consumption_confirmed": False,
+        "note": (
+            "SteamVR selection can be diagnosed here, but VRChat skeleton "
+            "consumption still requires an in-game finger-motion check."
+        ),
+    })
+    return jsonify(result)
+
+
+@app.route("/api/vmt/install", methods=["POST"])
+def vmt_install():
+    manager = find_vmt_manager([PROJECT_ROOT, RUNTIME_ROOT])
+    if manager:
+        try:
+            if not launch_elevated(manager, "install"):
+                raise RuntimeError("Windows refused to launch the VMT manager")
+            return jsonify({
+                "status": "ok",
+                "stage": "driver_install",
+                "message": "VMT 驱动安装程序已启动。完成后请重启 SteamVR。",
+                "manager_path": str(manager),
+            })
+        except Exception as exc:
+            return jsonify({
+                "status": "error",
+                "message": f"启动 VMT 驱动安装失败: {exc}",
+            }), 500
+
+    if vmt_installer_is_running():
+        return jsonify({
+            "status": "warning",
+            "stage": "installer_running",
+            "message": "VMT 安装程序正在运行，请先完成桌面的安装/UAC 窗口。",
+        })
+
+    installer_path = RUNTIME_ROOT / "tools" / VMT_INSTALLER_NAME
+    try:
+        installer = download_vmt_installer(installer_path)
+        if not launch_elevated(installer):
+            raise RuntimeError("Windows refused to launch the VMT installer")
+        return jsonify({
+            "status": "warning",
+            "stage": "manager_setup",
+            "message": (
+                "VMT 官方安装程序已启动。完成软件安装后，再点击一次“安装 VMT 驱动”，"
+                "然后重启 SteamVR。"
+            ),
+            "installer_path": str(installer),
+        })
+    except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "message": f"下载或启动 VMT 官方安装程序失败: {exc}",
+        }), 500
 
 
 @app.route("/api/steamvr/install", methods=["POST"])
@@ -660,15 +1902,19 @@ def start_mocap():
             mocap_process.kill()
 
     # 自动检测并终止所有残留的动捕进程（可能是之前崩溃或手动启动的）
-    killed_count = kill_stale_mocap_processes()
-    if killed_count > 0:
-        print(f"已自动终止 {killed_count} 个残留动捕进程")
-
     args = request.json or {}
-    cmd = [sys.executable, "-uB", str(PROJECT_ROOT / "bin" / "main.py")]
+    if args.get("cleanup_stale"):
+        killed_count = kill_stale_mocap_processes()
+        if killed_count > 0:
+            print(f"Cleaned up {killed_count} stale mocap process(es)")
+
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--mocap-child"]
+    else:
+        cmd = [sys.executable, "-uB", str(PROJECT_ROOT / "bin" / "main.py")]
 
     # 传递配置文件路径
-    config_file = PROJECT_ROOT / "config" / "config.json"
+    config_file = active_config_path()
     if config_file.exists():
         cmd.extend(["--config", str(config_file)])
 
@@ -688,9 +1934,12 @@ def start_mocap():
         cmd.extend(["--camera", str(args["camera"])])
 
     env = os.environ.copy()
-    env["ULTRALYTICS_SETTINGS"] = str(PROJECT_ROOT / ".ultralytics")
+    env["ULTRALYTICS_SETTINGS"] = str(RUNTIME_ROOT / ".ultralytics")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["YOLO26N_HMD_DASHBOARD_BRIDGE"] = "1"
+    env["YOLO26N_HMD_DASHBOARD_HOST"] = "127.0.0.1"
+    env["YOLO26N_HMD_DASHBOARD_PORT"] = str(_dashboard_runtime["port"])
 
     # 日志输出到临时目录
     import tempfile
@@ -698,31 +1947,32 @@ def start_mocap():
     log_file = open(str(log_path), 'w', encoding='utf-8')
 
     mocap_process = subprocess.Popen(
-        cmd, env=env, cwd=str(PROJECT_ROOT),
+        cmd, env=env, cwd=str(RUNTIME_ROOT),
         stdout=log_file, stderr=subprocess.STDOUT,
     )
     mocap_status = {
         "running": True,
         "pid": mocap_process.pid,
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "starting": True,
     }
 
-    # 等待 2 秒检查进程是否立即崩溃
-    time.sleep(2)
+    # Fast return: avoid blocking the dashboard while YOLO/MediaPipe/camera finish initializing.
+    time.sleep(0.2)
     if mocap_process.poll() is not None:
-        mocap_status = {"running": False, "pid": None, "start_time": None}
+        mocap_status = {"running": False, "pid": None, "start_time": None, "starting": False}
         return jsonify({
             "status": "error",
             "message": "进程启动后立即退出，可能是摄像头被占用或模型加载失败",
             "exit_code": mocap_process.returncode,
         })
 
-    return jsonify({"status": "ok", "pid": mocap_process.pid})
+    return jsonify({"status": "ok", "pid": mocap_process.pid, "starting": True})
 
 
 @app.route("/api/mocap/stop", methods=["POST"])
 def stop_mocap():
-    global mocap_process, mocap_status
+    global mocap_process, mocap_status, _mocap_process_cache
 
     stopped_any = False
 
@@ -752,35 +2002,53 @@ def stop_mocap():
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-    mocap_status = {"running": False, "pid": None, "start_time": None}
+    mocap_status = {"running": False, "pid": None, "start_time": None, "starting": False}
+    _mocap_process_cache = {"data": [], "ts": 0.0}
+    try:
+        mark_tracking_stopped()
+    except OSError as exc:
+        print(f"Runtime status stop marker failed: {exc}")
     if stopped_any:
         return jsonify({"status": "ok"})
     else:
         return jsonify({"status": "ok", "message": "Not running"})
 
 
-def _find_mocap_processes() -> list:
+def _find_mocap_processes(use_cache: bool = True) -> list:
     """查找所有动捕进程 (main.py)，排除当前 Dashboard 进程
 
     Returns:
         list of dict: [{"pid": int, "cmdline": str, "managed": bool}, ...]
     """
+    global _mocap_process_cache
     found = []
     if not HAS_PSUTIL:
         return found
+
+    now = time.time()
+    if use_cache and now - _mocap_process_cache.get("ts", 0.0) < MOCAP_SCAN_TTL_SECONDS:
+        return _mocap_process_cache.get("data", [])
 
     current_pid = os.getpid()
     managed_pid = mocap_process.pid if mocap_process and mocap_process.poll() is None else None
 
     try:
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cwd']):
+        # Query only cheap fields for every process. Reading cmdline/cwd for
+        # all Windows processes can block the Dashboard status endpoint for
+        # several seconds, especially while camera and GPU services are busy.
+        for proc in psutil.process_iter(["pid", "name"]):
             try:
                 if proc.pid == current_pid:
                     continue
-                if 'python' not in proc.name().lower() and 'python.exe' not in proc.name().lower():
+                proc_name = str(proc.info.get("name") or "").lower()
+                if (
+                    'python' not in proc_name
+                    and 'python.exe' not in proc_name
+                    and 'yolo26n-vrc-mocap' not in proc_name
+                ):
                     continue
                 cmdline = proc.cmdline()
-                if not any('main.py' in arg for arg in cmdline):
+                if not any('main.py' in arg or '--mocap-child' in arg for arg in cmdline):
                     continue
 
                 # 排除 dashboard_server.py 自身 (防止误匹配)
@@ -794,12 +2062,34 @@ def _find_mocap_processes() -> list:
     except Exception:
         pass
 
+    _mocap_process_cache = {"data": found, "ts": now}
     return found
+
+
+def _runtime_state_process_alive(state: dict) -> bool:
+    try:
+        state_pid = int(state.get("pid"))
+    except (TypeError, ValueError):
+        return False
+
+    if mocap_process and mocap_process.poll() is None:
+        return mocap_process.pid == state_pid
+    if not HAS_PSUTIL:
+        return False
+    try:
+        process = psutil.Process(state_pid)
+        cmdline = process.cmdline()
+        return process.is_running() and any(
+            "main.py" in arg or "--mocap-child" in arg
+            for arg in cmdline
+        )
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
 
 
 @app.route("/api/mocap/status", methods=["GET"])
 def mocap_status_api():
-    managed_running = mocap_process and mocap_process.poll() is None
+    managed_running = bool(mocap_process and mocap_process.poll() is None)
 
     all_mocap_procs = _find_mocap_processes()
     managed_procs = [p for p in all_mocap_procs if p["managed"]]
@@ -808,6 +2098,22 @@ def mocap_status_api():
     any_running = len(all_mocap_procs) > 0
 
     if managed_running:
+        if mocap_status.get("starting"):
+            try:
+                import tempfile
+                log_path = Path(tempfile.gettempdir()) / "yolo26n_mocap.log"
+                if log_path.exists():
+                    text = _read_text_tail(log_path, 64 * 1024)
+                    if (
+                        "System initialized successfully!" in text
+                        or "Mocap running!" in text
+                        or "Warmup complete" in text
+                        or "[Loop]" in text
+                        or "[Status]" in text
+                    ):
+                        mocap_status["starting"] = False
+            except Exception:
+                pass
         return jsonify({
             **mocap_status,
             "running": True,
@@ -815,6 +2121,7 @@ def mocap_status_api():
             "external_procs": external_procs,
             "stale_pids": [p["pid"] for p in external_procs],
         })
+
     elif any_running:
         mocap_status["running"] = False
         first_external = external_procs[0] if external_procs else managed_procs[0]
@@ -827,7 +2134,7 @@ def mocap_status_api():
             "stale_pids": [],
         })
     else:
-        mocap_status["running"] = False
+        mocap_status.update({"running": False, "pid": None, "start_time": None, "starting": False})
         return jsonify({
             **mocap_status,
             "running": False,
@@ -853,11 +2160,8 @@ def mocap_log_api():
     if not log_path.exists():
         return jsonify({"log": "", "exists": False})
     try:
-        with open(str(log_path), "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        # 返回最后 N 行
-        recent = lines[-tail:] if len(lines) > tail else lines
-        return jsonify({"log": "".join(recent), "exists": True, "total_lines": len(lines)})
+        recent, scanned_lines = _read_log_tail_lines(log_path, tail)
+        return jsonify({"log": recent, "exists": True, "total_lines": scanned_lines, "tail_only": True})
     except Exception as e:
         return jsonify({"log": f"读取日志失败: {e}", "exists": True})
 
@@ -865,29 +2169,142 @@ def mocap_log_api():
 @app.route("/api/mocap/inference_status", methods=["GET"])
 def inference_status_api():
     """从日志中解析推理模块的当前状态"""
+    global _inference_status_cache
     import tempfile
     import re
+
+    runtime_state = read_tracking_state(max_age_seconds=2.5)
+    if (
+        runtime_state
+        and runtime_state.get("running")
+        and not runtime_state.get("stale")
+        and _runtime_state_process_alive(runtime_state)
+    ):
+        modules = runtime_state.get("modules", {})
+        body = modules.get("body") or {}
+        face = modules.get("face") or {}
+        hand = modules.get("hand") or {}
+        return jsonify({
+            "body": bool(body.get("enabled") and body.get("initialized")),
+            "face": bool(face.get("enabled") and face.get("initialized")),
+            "hand": bool(hand.get("enabled") and hand.get("initialized")),
+            "available": True,
+            "running": True,
+            "body_pose_nodes": body.get("pose_node_count", 0),
+            "body_tracker_messages": body.get(
+                "streamer_last_tracker_count",
+                body.get("tracker_node_count", 0),
+            ),
+            "body_stream_sent": body.get("streamer_send_count", 0),
+            "body_stream_errors": body.get("streamer_error_count", 0),
+            "body_stream_queued": body.get("stream_queued", False),
+            "source": "runtime_state",
+            "cached": False,
+        })
+
+    mocap_running = bool(mocap_process and mocap_process.poll() is None) or bool(_find_mocap_processes())
+    if not mocap_running:
+        return jsonify({
+            "body": False,
+            "face": False,
+            "hand": False,
+            "available": True,
+            "running": False,
+            "body_pose_nodes": 0,
+            "body_tracker_messages": 0,
+            "body_stream_sent": 0,
+            "body_stream_errors": 0,
+            "body_stream_queued": False,
+        })
+
     log_path = Path(tempfile.gettempdir()) / "yolo26n_mocap.log"
     if not log_path.exists():
-        return jsonify({"body": None, "face": None, "hand": None, "available": False})
+        return jsonify({"body": None, "face": None, "hand": None, "available": False, "running": True})
     try:
-        with open(str(log_path), "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
+        stat = log_path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+        now = time.time()
+        cached = _inference_status_cache.get("data")
+        if (
+            cached is not None
+            and _inference_status_cache.get("signature") == signature
+            and now - _inference_status_cache.get("ts", 0.0) < INFERENCE_STATUS_TTL_SECONDS
+        ):
+            return jsonify({**cached, "cached": True})
+
+        content = _read_text_tail(log_path)
 
         # 从 [Status] 行解析推理状态 (Body:ON/OFF Face:ON/OFF Hand:ON/OFF)
         body_status = None
         face_status = None
         hand_status = None
+        body_pose_nodes = None
+        body_tracker_messages = None
+        body_stream_sent = None
+        body_stream_errors = None
+        body_stream_queued = None
 
         # 查找最后一个 [Status] 行
         status_matches = re.findall(
-            r'\[Status\].*Body:(\w+)\s+Face:(\w+)\s+Hand:(\w+)', content
+            r'\[Status\].*Body:(ON|OFF)(?:\([^)]*\))?\s+\|\s+Face:(ON|OFF)(?:\([^)]*\))?\s+\|\s+Hand:(ON|OFF)(?:\([^)]*\))?',
+            content,
         )
+        if not status_matches:
+            status_matches = re.findall(
+                r'\[Status\].*Body:(ON|OFF)(?:\([^)]*\))?.*Face:(ON|OFF)(?:\([^)]*\))?.*Hand:(ON|OFF)(?:\([^)]*\))?',
+                content,
+            )
         if status_matches:
             last = status_matches[-1]
             body_status = last[0] == "ON"
             face_status = last[1] == "ON"
             hand_status = last[2] == "ON"
+
+        status_lines = re.findall(r'^\[Status\].*$', content, flags=re.MULTILINE)
+        if status_lines:
+            last_status_line = status_lines[-1]
+            details_match = re.search(
+                r'Body:(?:ON|OFF)\(([^)]*)\)',
+                last_status_line,
+            )
+            if details_match:
+                details = details_match.group(1)
+                for key, attr in [
+                    ("nodes", "body_pose_nodes"),
+                    ("trackers", "body_tracker_messages"),
+                    ("sent", "body_stream_sent"),
+                    ("err", "body_stream_errors"),
+                ]:
+                    match = re.search(rf'{key}=([0-9]+)', details)
+                    if not match:
+                        continue
+                    value = int(match.group(1))
+                    if attr == "body_pose_nodes":
+                        body_pose_nodes = value
+                    elif attr == "body_tracker_messages":
+                        body_tracker_messages = value
+                    elif attr == "body_stream_sent":
+                        body_stream_sent = value
+                    elif attr == "body_stream_errors":
+                        body_stream_errors = value
+
+        loop_lines = re.findall(r'^\[Loop\].*$', content, flags=re.MULTILINE)
+        if loop_lines:
+            last_loop_line = loop_lines[-1]
+            body_rate_match = re.search("\u8eab\u4f53=([0-9]+(?:\\.[0-9]+)?)%", last_loop_line)
+            if body_rate_match:
+                try:
+                    body_status = float(body_rate_match.group(1)) > 0.0
+                except ValueError:
+                    pass
+            pose_match = re.search(
+                "\u59ff\u6001=([0-9]+)\u8282\u70b9/([0-9]+)\u70b9/\u961f\u5217=(ON|OFF)",
+                last_loop_line,
+            )
+            if pose_match:
+                body_pose_nodes = int(pose_match.group(1))
+                body_tracker_messages = int(pose_match.group(2))
+                body_stream_queued = pose_match.group(3) == "ON"
 
         # 也从 HotReload 行解析 (覆盖 Status 解析结果，因为 HotReload 更新)
         hotreload_matches = re.findall(
@@ -908,14 +2325,30 @@ def inference_status_api():
         if hotreload_hand:
             hand_status = hotreload_hand[-1] == "ON"
 
-        return jsonify({
+        if body_status is None and "Body module: initialized" in content and "[Loop]" in content:
+            body_status = True
+        if face_status is None and "Face module: initialized" in content and "[Loop]" in content:
+            face_status = True
+        if hand_status is None and "Hand module: initialized" in content and "[Loop]" in content:
+            hand_status = True
+
+        data = {
             "body": body_status,
             "face": face_status,
             "hand": hand_status,
             "available": body_status is not None or face_status is not None or hand_status is not None,
-        })
+            "running": True,
+            "body_pose_nodes": body_pose_nodes,
+            "body_tracker_messages": body_tracker_messages,
+            "body_stream_sent": body_stream_sent,
+            "body_stream_errors": body_stream_errors,
+            "body_stream_queued": body_stream_queued,
+            "cached": False,
+        }
+        _inference_status_cache = {"data": data, "ts": now, "signature": signature}
+        return jsonify(data)
     except Exception as e:
-        return jsonify({"body": None, "face": None, "hand": None, "available": False, "error": str(e)})
+        return jsonify({"body": None, "face": None, "hand": None, "available": False, "running": True, "error": str(e)})
 
 
 # ============ 数据集管理 API ============
@@ -960,9 +2393,6 @@ def browse_directory():
                 entries.append({
                     "name": item.name,
                     "path": str(item),
-                    "has_dataset_yaml": (item / "dataset.yaml").exists(),
-                    "has_images": (item / "images").exists(),
-                    "has_labels": (item / "labels").exists(),
                 })
             except PermissionError:
                 continue
@@ -980,488 +2410,115 @@ def browse_directory():
         return jsonify({"type": "error", "message": str(e)}), 500
 
 
-@app.route("/api/datasets", methods=["GET"])
-def list_datasets():
-    """列出所有已导入的数据集"""
-    datasets = []
-    try:
-        DATASETS_DIR.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        return jsonify({"datasets": [], "error": "无法创建数据集目录，可能被 OneDrive 锁定"})
+# ============ ???? API ============
 
-    try:
-        dirs = sorted(DATASETS_DIR.iterdir())
-    except PermissionError:
-        return jsonify({"datasets": [], "error": "无法读取数据集目录"})
+MODEL_EXTENSIONS = {".pt", ".onnx", ".engine"}
+MODELS_DIR = RUNTIME_ROOT / "models"
 
+
+def _model_search_dirs():
+    dirs = [MODELS_DIR, RUNTIME_ROOT, PROJECT_ROOT]
+    unique = []
     for d in dirs:
-        if not d.is_dir():
+        resolved = d.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return unique
+
+
+def _model_info(path: Path, current_model: str = "") -> dict:
+    stat = path.stat()
+    return {
+        "name": path.name,
+        "path": str(path),
+        "size_mb": round(stat.st_size / (1024 * 1024), 2),
+        "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)),
+        "current": str(path) == current_model or path.name == current_model,
+    }
+
+
+@app.route("/api/models", methods=["GET"])
+def list_runtime_models():
+    global _model_cache
+    config = load_config()
+    current_model = str(config.get("yolo", {}).get("model_path", ""))
+    now = time.time()
+    if (
+        _model_cache.get("data") is not None
+        and _model_cache.get("current") == current_model
+        and now - _model_cache.get("ts", 0.0) < MODEL_CACHE_TTL_SECONDS
+    ):
+        return jsonify(_model_cache["data"])
+
+    models = []
+    seen = set()
+
+    for root in _model_search_dirs():
+        if not root.exists():
             continue
-        yaml_path = d / "dataset.yaml"
-        info = {
-            "name": d.name,
-            "path": str(d),
-            "has_yaml": yaml_path.exists(),
-            "valid": False,
-            "train_images": 0,
-            "val_images": 0,
-            "train_labels": 0,
-            "val_labels": 0,
-        }
+        for item in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not item.is_file() or item.suffix.lower() not in MODEL_EXTENSIONS:
+                continue
+            resolved = item.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            models.append(_model_info(item, current_model))
 
-        # 统计文件数量
-        train_img_dir = d / "images" / "train"
-        val_img_dir = d / "images" / "val"
-        train_lbl_dir = d / "labels" / "train"
-        val_lbl_dir = d / "labels" / "val"
-
-        if train_img_dir.exists():
-            info["train_images"] = len(list(train_img_dir.glob("*.*")))
-        if val_img_dir.exists():
-            info["val_images"] = len(list(val_img_dir.glob("*.*")))
-        if train_lbl_dir.exists():
-            info["train_labels"] = len(list(train_lbl_dir.glob("*.txt")))
-        if val_lbl_dir.exists():
-            info["val_labels"] = len(list(val_lbl_dir.glob("*.txt")))
-
-        info["valid"] = info["has_yaml"] and (info["train_images"] > 0 or info["train_labels"] > 0)
-        datasets.append(info)
-
-    return jsonify({"datasets": datasets})
+    data = {
+        "models": models,
+        "current": current_model,
+        "model_dir": str(MODELS_DIR),
+        "extensions": sorted(MODEL_EXTENSIONS),
+    }
+    _model_cache = {"data": data, "ts": now, "current": current_model}
+    return jsonify(data)
 
 
-@app.route("/api/datasets/import", methods=["POST"])
-def import_dataset():
-    """从指定路径导入数据集到项目目录
-
-    支持两种方式:
-    1. 复制: 将外部数据集复制到 datasets/ 目录下
-    2. 链接: 在 datasets/ 下创建符号链接 (节省磁盘空间)
-    """
+@app.route("/api/models/import", methods=["POST"])
+def import_runtime_model():
+    global _model_cache
     data = request.json or {}
-    source_path = data.get("source_path", "").strip()
-    dataset_name = data.get("name", "").strip()
-    link_mode = data.get("link", False)
+    source_path = str(data.get("source_path", "")).strip()
+    mode = data.get("mode", "copy")
+    set_current = data.get("set_current", True) is not False
 
     if not source_path:
-        return jsonify({"status": "error", "message": "请指定数据集源路径"}), 400
+        return jsonify({"status": "error", "message": "source_path is required"}), 400
 
-    source = Path(source_path)
-    if not source.exists():
-        return jsonify({"status": "error", "message": f"路径不存在: {source_path}"}), 400
+    source = Path(source_path).expanduser()
+    if not source.exists() or not source.is_file():
+        return jsonify({"status": "error", "message": f"Model file not found: {source_path}"}), 400
+    if source.suffix.lower() not in MODEL_EXTENSIONS:
+        return jsonify({"status": "error", "message": "Supported model extensions: .pt, .onnx, .engine"}), 400
 
-    # 自动推断名称
-    if not dataset_name:
-        dataset_name = source.name
-
-    target = DATASETS_DIR / dataset_name
-    DATASETS_DIR.mkdir(parents=True, exist_ok=True)
-
-    if target.exists():
-        return jsonify({"status": "error", "message": f"数据集 '{dataset_name}' 已存在"}), 400
-
-    try:
-        if link_mode:
-            # 创建符号链接
-            target.symlink_to(source.resolve())
-            msg = f"已创建符号链接: {target} -> {source}"
-        else:
-            # 复制数据集
-            shutil.copytree(str(source), str(target))
-            msg = f"已复制数据集到: {target}"
-
-        # 检查是否有 dataset.yaml，没有则自动生成
-        yaml_path = target / "dataset.yaml"
-        if not yaml_path.exists():
-            _auto_generate_dataset_yaml(target)
-
-        return jsonify({"status": "ok", "message": msg, "name": dataset_name, "path": str(target)})
-    except Exception as e:
-        # 清理失败的导入
-        if target.exists() or target.is_symlink():
-            try:
-                if target.is_symlink():
-                    target.unlink()
-                else:
-                    shutil.rmtree(str(target))
-            except Exception:
-                pass
-        return jsonify({"status": "error", "message": f"导入失败: {str(e)}"}), 500
-
-
-@app.route("/api/datasets/create", methods=["POST"])
-def create_dataset():
-    """创建空数据集目录结构"""
-    data = request.json or {}
-    dataset_name = data.get("name", "").strip()
-
-    if not dataset_name:
-        return jsonify({"status": "error", "message": "请指定数据集名称"}), 400
-
-    target = DATASETS_DIR / dataset_name
-    try:
-        DATASETS_DIR.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        return jsonify({"status": "error", "message": f"无法创建数据集目录 (权限不足): {DATASETS_DIR}，请检查目录权限或手动创建 datasets 文件夹"}), 500
-
-    if target.exists():
-        return jsonify({"status": "error", "message": f"数据集 '{dataset_name}' 已存在"}), 400
-
-    try:
-        # 创建目录结构
-        for subdir in ["images/train", "images/val", "labels/train", "labels/val"]:
-            (target / subdir).mkdir(parents=True, exist_ok=True)
-
-        # 生成 dataset.yaml
-        _auto_generate_dataset_yaml(target)
-
-        return jsonify({"status": "ok", "message": f"数据集 '{dataset_name}' 已创建", "name": dataset_name, "path": str(target)})
-    except PermissionError:
-        return jsonify({"status": "error", "message": f"创建失败: 权限不足，请检查 {DATASETS_DIR} 目录权限"}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"创建失败: {str(e)}"}), 500
-
-
-@app.route("/api/datasets/<name>", methods=["DELETE"])
-def delete_dataset(name):
-    """删除数据集"""
-    target = DATASETS_DIR / name
-    if not target.exists():
-        return jsonify({"status": "error", "message": "数据集不存在"}), 404
-
-    try:
-        if target.is_symlink():
-            target.unlink()
-        else:
-            shutil.rmtree(str(target))
-        return jsonify({"status": "ok", "message": f"数据集 '{name}' 已删除"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"删除失败: {str(e)}"}), 500
-
-
-@app.route("/api/datasets/<name>/validate", methods=["GET"])
-def validate_dataset(name):
-    """验证数据集"""
-    target = DATASETS_DIR / name
-    if not target.exists():
-        return jsonify({"status": "error", "message": "数据集不存在"}), 404
-
-    yaml_path = target / "dataset.yaml"
-    result = {
-        "name": name,
-        "path": str(target),
-        "has_yaml": yaml_path.exists(),
-        "errors": [],
-        "warnings": [],
-        "stats": {},
-    }
-
-    # 检查 yaml
-    if not yaml_path.exists():
-        result["errors"].append("缺少 dataset.yaml 配置文件")
+    if mode == "absolute":
+        model_path = str(source.resolve())
     else:
-        try:
-            import yaml
-            with open(yaml_path, 'r', encoding='utf-8') as f:
-                cfg = yaml.safe_load(f)
-            if 'path' not in cfg:
-                result["errors"].append("dataset.yaml 缺少 path 字段")
-            if 'names' not in cfg:
-                result["warnings"].append("dataset.yaml 缺少 names 字段")
-            if 'kpt_shape' not in cfg:
-                result["warnings"].append("dataset.yaml 缺少 kpt_shape 字段 (姿态训练需要)")
-        except Exception as e:
-            result["errors"].append(f"dataset.yaml 解析失败: {e}")
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        target = MODELS_DIR / source.name
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+        model_path = str(target)
 
-    # 统计
-    for split in ["train", "val"]:
-        img_dir = target / "images" / split
-        lbl_dir = target / "labels" / split
-        img_count = len(list(img_dir.glob("*.*"))) if img_dir.exists() else 0
-        lbl_count = len(list(lbl_dir.glob("*.txt"))) if lbl_dir.exists() else 0
-        result["stats"][split] = {"images": img_count, "labels": lbl_count}
+    if set_current:
+        with _config_lock:
+            config = load_config()
+            yolo_cfg = config.setdefault("yolo", {})
+            yolo_cfg["model_path"] = model_path
+            yolo_cfg["model_type"] = "custom"
+            save_config(config)
+    _model_cache = {"data": None, "ts": 0.0, "current": None}
 
-        if img_count == 0:
-            result["warnings"].append(f"{split} 集没有图像")
-        if lbl_count == 0 and img_count > 0:
-            result["warnings"].append(f"{split} 集有图像但没有标签")
-
-    result["valid"] = len(result["errors"]) == 0
-    return jsonify(result)
-
-
-# ============ 训练 API ============
-
-@app.route("/api/train/start", methods=["POST"])
-def start_training():
-    """启动训练"""
-    global train_process, train_status
-
-    if train_status["running"] and train_process and train_process.poll() is None:
-        return jsonify({"status": "error", "message": "训练已在运行中"})
-
-    # 先停掉之前的残留进程
-    if train_process and train_process.poll() is None:
-        train_process.terminate()
-        try:
-            train_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            train_process.kill()
-
-    data = request.json or {}
-    dataset_name = data.get("dataset", "").strip()
-    if not dataset_name:
-        return jsonify({"status": "error", "message": "请选择数据集"}), 400
-
-    yaml_path = DATASETS_DIR / dataset_name / "dataset.yaml"
-    if not yaml_path.exists():
-        return jsonify({"status": "error", "message": f"数据集配置文件不存在: {dataset_name}/dataset.yaml"}), 400
-
-    # 构建训练命令
-    cmd = [
-        sys.executable, "-B",
-        str(PROJECT_ROOT / "bin" / "train.py"),
-        "--data", str(yaml_path),
-        "--epochs", str(data.get("epochs", 100)),
-        "--batch", str(data.get("batch", 16)),
-        "--imgsz", str(data.get("imgsz", 640)),
-        "--device", data.get("device", "auto"),
-        "--project", str(PROJECT_ROOT / "runs" / "train"),
-    ]
-
-    if data.get("freeze", 0) > 0:
-        cmd.extend(["--freeze", str(data["freeze"])])
-    if data.get("model"):
-        cmd.extend(["--model", data["model"]])
-    if data.get("name"):
-        cmd.extend(["--name", data["name"]])
-    if data.get("hand_split", False):
-        cmd.append("--hand-split")
-    if data.get("model_type"):
-        cmd.extend(["--model-type", data["model_type"]])
-    if data.get("lr0"):
-        cmd.extend(["--lr0", str(data["lr0"])])
-    if data.get("optimizer"):
-        cmd.extend(["--optimizer", data["optimizer"]])
-    if data.get("patience") is not None:
-        cmd.extend(["--patience", str(data["patience"])])
-    if data.get("no_augment", False):
-        cmd.append("--no-augment")
-    if data.get("amp", True) is False:
-        cmd.append("--no-amp")
-    if data.get("cos_lr", True) is False:
-        cmd.append("--no-cos-lr")
-    if data.get("label_smoothing"):
-        cmd.extend(["--label-smoothing", str(data["label_smoothing"])])
-
-    env = os.environ.copy()
-    env["ULTRALYTICS_SETTINGS"] = str(PROJECT_ROOT / ".ultralytics")
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-
-    # 训练日志输出到文件
-    log_dir = PROJECT_ROOT / "runs" / "train" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log"
-
-    train_process = subprocess.Popen(
-        cmd, env=env, cwd=str(PROJECT_ROOT),
-        stdout=open(log_path, "w", encoding="utf-8"),
-        stderr=subprocess.STDOUT,
-    )
-    train_status = {
-        "running": True,
-        "pid": train_process.pid,
-        "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "name": dataset_name,
-        "log": str(log_path),
-    }
-
-    # 等待 3 秒检查进程是否立即崩溃
-    time.sleep(3)
-    if train_process.poll() is not None:
-        train_status = {"running": False, "pid": None, "start_time": None, "name": None}
-        # 读取日志查看错误原因
-        try:
-            error_msg = log_path.read_text(encoding="utf-8")[-500:]
-        except OSError:
-            error_msg = "未知错误"
-        return jsonify({
-            "status": "error",
-            "message": "训练进程启动后立即退出",
-            "detail": error_msg,
-        })
-
-    return jsonify({"status": "ok", "pid": train_process.pid, "log": str(log_path)})
-
-
-@app.route("/api/train/stop", methods=["POST"])
-def stop_training():
-    """停止训练"""
-    global train_process, train_status
-
-    if train_process and train_process.poll() is None:
-        train_process.terminate()
-        try:
-            train_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            train_process.kill()
-        train_status = {"running": False, "pid": None, "start_time": None, "name": None}
-        return jsonify({"status": "ok"})
-    else:
-        train_status = {"running": False, "pid": None, "start_time": None, "name": None}
-        return jsonify({"status": "ok", "message": "训练未在运行"})
-
-
-@app.route("/api/train/status", methods=["GET"])
-def train_status_api():
-    """查询训练状态"""
-    if train_process and train_process.poll() is None:
-        return jsonify({**train_status, "running": True})
-    else:
-        if train_status["running"]:
-            train_status["running"] = False
-        return jsonify({**train_status, "running": False})
-
-
-@app.route("/api/train/log", methods=["GET"])
-def train_log():
-    """查看训练日志"""
-    log_path = train_status.get("log") or request.args.get("path")
-    if not log_path:
-        return jsonify({"log": "", "message": "无日志文件"})
-
-    try:
-        path = Path(log_path)
-        if not path.exists():
-            return jsonify({"log": "", "message": "日志文件不存在"})
-        # 读取最后 200 行
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        tail = lines[-200:] if len(lines) > 200 else lines
-        return jsonify({"log": "".join(tail), "total_lines": len(lines)})
-    except OSError as e:
-        return jsonify({"log": "", "message": f"读取日志失败: {e}"})
-
-
-@app.route("/api/train/models", methods=["GET"])
-def list_trained_models():
-    """列出已训练的模型"""
-    models = []
-    runs_dir = PROJECT_ROOT / "runs" / "train"
-    if not runs_dir.exists():
-        # 也检查 runs/pose/runs/train
-        runs_dir = PROJECT_ROOT / "runs" / "pose" / "runs" / "train"
-
-    if runs_dir.exists():
-        for d in sorted(runs_dir.iterdir(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
-            if not d.is_dir():
-                continue
-            best = d / "weights" / "best.pt"
-            last = d / "weights" / "last.pt"
-            if best.exists() or last.exists():
-                mtime = datetime.fromtimestamp(d.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-                models.append({
-                    "name": d.name,
-                    "path": str(d),
-                    "best": str(best) if best.exists() else None,
-                    "last": str(last) if last.exists() else None,
-                    "modified": mtime,
-                })
-
-    return jsonify({"models": models})
-
-
-@app.route("/api/train/presets", methods=["GET"])
-def get_model_presets():
-    """获取模型精度等级预设列表"""
-    from train import ModelTrainer
-    presets = {}
-    for key, preset in ModelTrainer.MODEL_PRESETS.items():
-        presets[key] = {
-            "name": preset["name"],
-            "model": preset["model"],
-            "description": preset["description"],
-            "default_imgsz": preset["default_imgsz"],
-            "default_batch": preset["default_batch"],
-            "default_lr0": preset["default_lr0"],
-            "params_m": preset["params_m"],
-            "speed_ms": preset["speed_ms"],
-        }
-    return jsonify({"presets": presets})
-
-
-@app.route("/api/train/analysis", methods=["GET"])
-def get_train_analysis():
-    """获取训练模型的分布分析图"""
-    model_name = request.args.get("model", "").strip()
-    if not model_name:
-        return jsonify({"error": "请指定模型名称"}), 400
-
-    # 查找分析图目录
-    runs_dir = PROJECT_ROOT / "runs" / "train"
-    analysis_dir = runs_dir / model_name / "analysis"
-
-    if not analysis_dir.exists():
-        # 也检查 runs/pose/runs/train
-        alt_dir = PROJECT_ROOT / "runs" / "pose" / "runs" / "train" / model_name / "analysis"
-        if alt_dir.exists():
-            analysis_dir = alt_dir
-        else:
-            return jsonify({"error": "分析图不存在，请先完成训练", "images": []})
-
-    images = []
-    for img_file in sorted(analysis_dir.glob("*.png")):
-        images.append({
-            "name": img_file.stem,
-            "path": f"/api/train/analysis/image?model={model_name}&image={img_file.name}",
-        })
-
-    return jsonify({"images": images})
-
-
-@app.route("/api/train/analysis/image", methods=["GET"])
-def get_analysis_image():
-    """获取分析图图片"""
-    model_name = request.args.get("model", "").strip()
-    image_name = request.args.get("image", "").strip()
-
-    if not model_name or not image_name:
-        return "Missing parameters", 400
-
-    # 防止路径遍历攻击
-    if ".." in model_name or ".." in image_name or "/" in image_name or "\\" in image_name:
-        return "Invalid parameters", 400
-
-    runs_dir = PROJECT_ROOT / "runs" / "train"
-    img_path = runs_dir / model_name / "analysis" / image_name
-
-    if not img_path.exists():
-        alt_path = PROJECT_ROOT / "runs" / "pose" / "runs" / "train" / model_name / "analysis" / image_name
-        if alt_path.exists():
-            img_path = alt_path
-        else:
-            return "Image not found", 404
-
-    return send_from_directory(str(img_path.parent), img_path.name)
+    return jsonify({
+        "status": "ok",
+        "model_path": model_path,
+        "copied": mode != "absolute",
+        "current": set_current,
+    })
 
 
 # ============ 辅助函数 ============
-
-def _auto_generate_dataset_yaml(dataset_dir: Path):
-    """自动生成 dataset.yaml"""
-    import yaml
-    config = {
-        "path": str(dataset_dir.resolve()),
-        "train": "images/train",
-        "val": "images/val",
-        "nc": 1,
-        "names": {0: "person"},
-        "kpt_shape": [17, 3],
-    }
-    yaml_path = dataset_dir / "dataset.yaml"
-    with open(yaml_path, 'w', encoding='utf-8') as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-
 
 def _auto_start_hmd_provider():
     """根据配置文件自动启动 HMD provider
@@ -1490,6 +2547,10 @@ def _auto_start_hmd_provider():
             "quest_port": hmd_cfg.get("quest_port", 53342),
             "quest_udp_host": hmd_cfg.get("quest_udp_host", "0.0.0.0"),
             "quest_udp_port": hmd_cfg.get("quest_udp_port", 39541),
+            "sdk_udp_host": hmd_cfg.get("sdk_udp_host", "0.0.0.0"),
+            "sdk_udp_port": hmd_cfg.get("sdk_udp_port", 39542),
+            "prefer_openvr": hmd_cfg.get("prefer_openvr", True),
+            "tracking_origin": hmd_cfg.get("tracking_origin", "unknown"),
             "remote_port": hmd_cfg.get("remote_port", 4243),
         }
         provider = HMDProviderFactory.create(provider_type, **kwargs)
@@ -1502,7 +2563,9 @@ def _auto_start_hmd_provider():
         print(f"[AutoStart] HMD Provider: {provider_type} init error: {e}")
 
 
-def run_server(host="0.0.0.0", port=8765):
+def run_server(host="0.0.0.0", port=8766):
+    _dashboard_runtime["host"] = host
+    _dashboard_runtime["port"] = int(port)
     print(f"Dashboard running at http://{host}:{port}")
     # 自动恢复 HMD provider (根据配置文件)
     _auto_start_hmd_provider()
@@ -1514,25 +2577,81 @@ def run_server(host="0.0.0.0", port=8765):
 @app.route("/api/hmd/status", methods=["GET"])
 def hmd_status():
     """获取 HMD 提供者状态"""
+    config = load_config()
+    normalize_body_streaming_config(config)
+    height_scaling = _body_height_scaling_config(config)
     with _hmd_lock:
         if _hmd_provider is None:
             return jsonify({
                 "running": False,
                 "provider": "none",
                 "pose": None,
+                "anchor_trusted": False,
+                "anchor_applied": False,
+                "height_diagnostics": _height_posture_state(None, height_scaling),
             })
         pose = _hmd_provider.get_pose()
-        return jsonify({
+        anchor_trusted = hmd_pose_anchor_trusted(pose)
+        body_cfg = config.get("streaming", {}).get("body", {})
+        status = {
             "running": True,
             "provider": _hmd_provider.name,
+            "anchor_trusted": anchor_trusted,
+            "anchor_applied": bool(
+                anchor_trusted and not bool(body_cfg.get("decouple_from_hmd", False))
+            ),
             "pose": {
                 "position": pose.position,
                 "rotation": pose.rotation,
                 "quaternion": pose.quaternion,
                 "valid": pose.valid,
                 "timestamp": pose.timestamp,
+                "tracking_origin": pose.tracking_origin,
+                "actual_height": pose.actual_height,
+                "height_reference": pose.height_reference,
             },
-        })
+            "height_diagnostics": _height_posture_state(pose.actual_height, height_scaling),
+        }
+        if hasattr(_hmd_provider, "get_status_extra"):
+            try:
+                status.update(_hmd_provider.get_status_extra())
+            except Exception:
+                pass
+        return jsonify(status)
+
+
+@app.route("/api/hmd/standing_height", methods=["POST"])
+def hmd_record_standing_height():
+    with _hmd_lock:
+        if _hmd_provider is None:
+            return jsonify({"status": "error", "message": "HMD provider is not running"}), 400
+        pose = _hmd_provider.get_pose()
+    if not pose.valid or pose.actual_height is None:
+        return jsonify({
+            "status": "error",
+            "message": "当前 HMD 没有可用的 floor/standing 实际高度，无法记录站立眼高",
+            "tracking_origin": pose.tracking_origin,
+            "height_reference": pose.height_reference,
+        }), 400
+
+    standing_height = round(float(pose.actual_height), 3)
+    with _config_lock:
+        config = load_config()
+        normalize_body_streaming_config(config)
+        scaling = _body_height_scaling_config(config)
+        scaling["standing_eye_height"] = standing_height
+        scaling["standing_eye_height_calibrated"] = True
+        vrc_cfg = config.setdefault("vrc", {})
+        vrc_scaling = vrc_cfg.setdefault("hmd_height_scaling", {})
+        if isinstance(vrc_scaling, dict):
+            vrc_scaling["standing_eye_height"] = standing_height
+            vrc_scaling["standing_eye_height_calibrated"] = True
+        save_config(config)
+    return jsonify({
+        "status": "ok",
+        "standing_eye_height": standing_height,
+        "height_diagnostics": _height_posture_state(pose.actual_height, scaling),
+    })
 
 
 @app.route("/api/hmd/start", methods=["POST"])
@@ -1559,10 +2678,12 @@ def hmd_start():
             _hmd_mod_path = getattr(_hmd_mod, "__file__", None)
             if _hmd_mod_path:
                 from pathlib import Path
-                _hmd_mod_mtime = Path(_hmd_mod_path).stat().st_mtime
-                if not hasattr(hmd_start, "_last_mtime") or hmd_start._last_mtime < _hmd_mod_mtime:
-                    importlib.reload(_hmd_mod)
-                    hmd_start._last_mtime = _hmd_mod_mtime
+                _hmd_mod_path_obj = Path(_hmd_mod_path)
+                if not getattr(sys, "frozen", False) and _hmd_mod_path_obj.exists():
+                    _hmd_mod_mtime = _hmd_mod_path_obj.stat().st_mtime
+                    if not hasattr(hmd_start, "_last_mtime") or hmd_start._last_mtime < _hmd_mod_mtime:
+                        importlib.reload(_hmd_mod)
+                        hmd_start._last_mtime = _hmd_mod_mtime
 
             HMDProviderFactory = _hmd_mod.HMDProviderFactory
             kwargs = {
@@ -1575,6 +2696,10 @@ def hmd_start():
                 "quest_port": data.get("quest_port", 53342),
                 "quest_udp_host": data.get("quest_udp_host", "0.0.0.0"),
                 "quest_udp_port": data.get("quest_udp_port", 39541),
+                "sdk_udp_host": data.get("sdk_udp_host", "0.0.0.0"),
+                "sdk_udp_port": data.get("sdk_udp_port", 39542),
+                "prefer_openvr": data.get("prefer_openvr", True),
+                "tracking_origin": data.get("tracking_origin", "unknown"),
                 "remote_port": data.get("remote_port", 4243),
             }
             provider = HMDProviderFactory.create(provider_type, **kwargs)
@@ -1586,12 +2711,28 @@ def hmd_start():
                 _hmd_provider = provider
                 # 同步配置文件: 保存当前 provider 类型，重启后自动恢复
                 try:
-                    config = load_config()
-                    if "hmd" not in config:
-                        config["hmd"] = {}
-                    config["hmd"]["provider"] = provider.name
-                    config["hmd"]["remote_port"] = data.get("remote_port", 4243)
-                    save_config(config)
+                    with _config_lock:
+                        config = load_config()
+                        hmd_config = config.setdefault("hmd", {})
+                        hmd_config["provider"] = provider.name
+                        hmd_config["osc_listen_port"] = data.get("osc_listen_port", 9001)
+                        hmd_config["pico_host"] = data.get("pico_host", "127.0.0.1")
+                        hmd_config["pico_port"] = data.get("pico_port", 7890)
+                        hmd_config["pico_xrobo_host"] = data.get("pico_xrobo_host", "0.0.0.0")
+                        hmd_config["pico_xrobo_port"] = data.get("pico_xrobo_port", 39540)
+                        hmd_config["quest_host"] = data.get("quest_host", "127.0.0.1")
+                        hmd_config["quest_port"] = data.get("quest_port", 53342)
+                        hmd_config["quest_udp_host"] = data.get("quest_udp_host", "0.0.0.0")
+                        hmd_config["quest_udp_port"] = data.get("quest_udp_port", 39541)
+                        hmd_config["sdk_udp_host"] = data.get("sdk_udp_host", "0.0.0.0")
+                        hmd_config["sdk_udp_port"] = data.get("sdk_udp_port", 39542)
+                        hmd_config["prefer_openvr"] = data.get("prefer_openvr", True)
+                        hmd_config["tracking_origin"] = data.get("tracking_origin", "unknown")
+                        hmd_config["remote_port"] = data.get("remote_port", 4243)
+                        hmd_config["share_with_dashboard"] = True
+                        hmd_config["dashboard_host"] = "127.0.0.1"
+                        hmd_config["dashboard_port"] = _dashboard_runtime["port"]
+                        save_config(config)
                 except Exception:
                     pass
                 return jsonify({"status": "ok", "provider": provider.name, "message": f"HMD 提供者已启动: {provider.name}"})
@@ -1614,11 +2755,10 @@ def hmd_stop():
             _hmd_provider = None
             # 同步配置文件: 将 provider 设为 static，避免重启后自动启动
             try:
-                config = load_config()
-                if "hmd" not in config:
-                    config["hmd"] = {}
-                config["hmd"]["provider"] = "static"
-                save_config(config)
+                with _config_lock:
+                    config = load_config()
+                    config.setdefault("hmd", {})["provider"] = "static"
+                    save_config(config)
             except Exception:
                 pass
             return jsonify({"status": "ok", "message": f"HMD 提供者已停止: {name}"})
@@ -1643,11 +2783,12 @@ def tracking_toggle():
     if module not in ("body", "face", "hand"):
         return jsonify({"status": "error", "message": f"未知模块: {module}，支持: body, face, hand"}), 400
 
-    config = load_config()
-    if module not in config:
-        config[module] = {}
-    config[module]["enabled"] = enabled
-    save_config(config)
+    with _config_lock:
+        config = load_config()
+        if module not in config:
+            config[module] = {}
+        config[module]["enabled"] = enabled
+        save_config(config)
 
     module_names = {"body": "身体姿态", "face": "面部表情", "hand": "手势追踪"}
     return jsonify({
@@ -1660,12 +2801,31 @@ def tracking_toggle():
 
 @app.route("/api/tracking/status", methods=["GET"])
 def tracking_status():
-    """获取各识别模块的开关状态"""
+    """Return configured switches plus structured child-process diagnostics."""
     config = load_config()
+    state = read_tracking_state(max_age_seconds=2.5)
+    runtime_available = bool(
+        state
+        and not state.get("stale")
+        and state.get("running")
+        and _runtime_state_process_alive(state)
+    )
+    modules = state.get("modules", {}) if runtime_available else {}
     return jsonify({
         "body": config.get("body", {}).get("enabled", True),
         "face": config.get("face", {}).get("enabled", True),
         "hand": config.get("hand", {}).get("enabled", True),
+        "running": bool(runtime_available),
+        "runtime_available": bool(runtime_available),
+        "runtime_stale": bool(state.get("stale")) if state else False,
+        "age_seconds": state.get("age_seconds") if state else None,
+        "fps": state.get("fps") if runtime_available else None,
+        "frame_count": state.get("frame_count") if runtime_available else None,
+        "parallel_inference": state.get("parallel_inference") if runtime_available else None,
+        "body_details": modules.get("body"),
+        "face_details": modules.get("face"),
+        "hand_details": modules.get("hand"),
+        "hmd": state.get("hmd") if runtime_available else None,
     })
 
 
@@ -1673,6 +2833,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="YOLO26n VRC Mocap Dashboard")
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args()
     run_server(args.host, args.port)

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' http://127.0.0.1:* http://localhost:*; script-src 'self'; style-src 'self'; img-src 'self' data: http://127.0.0.1:* http://localhost:*; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; frame-src http://127.0.0.1:* http://localhost:*;">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YOLO26n VRC Mocap</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="toolbar">
+      <div class="brand">
+        <div class="mark">Y</div>
+        <div class="brandText">
+          <div class="title">YOLO26n VRC Mocap</div>
+          <div class="subtitle" id="backendUrl">http://127.0.0.1:8766</div>
+        </div>
+      </div>
+      <div class="status">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">后端检查中</span>
+      </div>
+      <div class="actions">
+        <button id="startBackend" title="启动后端">启动</button>
+        <button id="restartBackend" title="重启由本界面启动的后端">重启</button>
+        <button id="stopBackend" title="停止由本界面启动的后端">停止</button>
+        <button id="reloadDashboard" title="刷新 Dashboard">刷新</button>
+        <button id="openBrowser" title="在浏览器打开 Dashboard">浏览器</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="dashboardPanel">
+        <iframe id="dashboardView" title="YOLO26n Dashboard" src="about:blank"></iframe>
+        <div class="loading" id="loadingOverlay">
+          <div class="spinner"></div>
+          <div>等待后端 Dashboard...</div>
+        </div>
+      </section>
+
+      <aside class="consolePanel" id="consolePanel">
+        <div class="consoleHeader">
+          <div>
+            <div class="consoleTitle">后端控制台</div>
+            <div class="consoleHint">已合并原 cmd 窗口输出</div>
+          </div>
+          <div class="consoleActions">
+            <button id="clearLogs" title="清空当前显示日志">清空</button>
+            <button id="toggleConsole" title="折叠或展开日志区域">折叠</button>
+          </div>
+        </div>
+        <pre id="logOutput"></pre>
+      </aside>
+    </main>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

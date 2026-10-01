@@ -395,16 +395,19 @@ class VRCTransmitter:
 
         # 部位名 -> 3D 位置映射 (已变换到 SteamVR 坐标系)
         body_part_positions = {
-            "Hips": hip_center,
-            "Chest": [(shoulder_center[i] * 0.6 + hip_center[i] * 0.4) for i in range(3)],
-            "LeftFoot": steamvr_pose.get("LeftFoot", [0, 0, 0]),
-            "RightFoot": steamvr_pose.get("RightFoot", [0, 0, 0]),
-            "LeftKnee": steamvr_pose.get("LeftLowerLeg", [0, 0, 0]),
-            "RightKnee": steamvr_pose.get("RightLowerLeg", [0, 0, 0]),
+            "Hips": steamvr_pose.get("HipsTracker", hip_center),
+            "Chest": steamvr_pose.get(
+                "ChestTracker",
+                [(shoulder_center[i] * 0.6 + hip_center[i] * 0.4) for i in range(3)]
+            ),
+            "LeftFoot": steamvr_pose.get("LeftFootTracker", steamvr_pose.get("LeftFoot", [0, 0, 0])),
+            "RightFoot": steamvr_pose.get("RightFootTracker", steamvr_pose.get("RightFoot", [0, 0, 0])),
+            "LeftKnee": steamvr_pose.get("LeftKneeTracker", steamvr_pose.get("LeftUpperLeg", [0, 0, 0])),
+            "RightKnee": steamvr_pose.get("RightKneeTracker", steamvr_pose.get("RightUpperLeg", [0, 0, 0])),
             "LeftHand": steamvr_pose.get("LeftHand", [0, 0, 0]),
             "RightHand": steamvr_pose.get("RightHand", [0, 0, 0]),
-            "LeftElbow": steamvr_pose.get("LeftLowerArm", [0, 0, 0]),
-            "RightElbow": steamvr_pose.get("RightLowerArm", [0, 0, 0]),
+            "LeftElbow": steamvr_pose.get("LeftElbowTracker", steamvr_pose.get("LeftUpperArm", [0, 0, 0])),
+            "RightElbow": steamvr_pose.get("RightElbowTracker", steamvr_pose.get("RightUpperArm", [0, 0, 0])),
             "Head": steamvr_pose.get("Head", [0, 0, 0]),
         }
 
@@ -768,40 +771,69 @@ class VRCTransmitter:
 
         # ===== 身体追踪器发送 (仅当有身体数据时) =====
         if not body_only:
-            # VRChat OSC 追踪器编号映射
             osc_tracker_map = {
-            "Hips": 1,              # Waist
-            "LeftFoot": 2,          # Left Foot
-            "RightFoot": 3,         # Right Foot
-            "Chest": 4,             # Chest
-            "LeftLowerLeg": 5,      # Left Knee
-            "RightLowerLeg": 6,     # Right Knee
-            "LeftLowerArm": 7,      # Left Elbow
-            "RightLowerArm": 8,     # Right Elbow
-        }
+                "HipsTracker": 1,
+                "LeftFootTracker": 2,
+                "RightFootTracker": 3,
+                "ChestTracker": 4,
+                "LeftKneeTracker": 5,
+                "RightKneeTracker": 6,
+                "LeftElbowTracker": 7,
+                "RightElbowTracker": 8,
+            }
+            tracker_toggle_bone = {
+                "HipsTracker": "Hips",
+                "ChestTracker": "Chest",
+                "LeftFootTracker": "LeftFoot",
+                "RightFootTracker": "RightFoot",
+                "LeftKneeTracker": "LeftLowerLeg",
+                "RightKneeTracker": "RightLowerLeg",
+                "LeftElbowTracker": "LeftLowerArm",
+                "RightElbowTracker": "RightLowerArm",
+            }
+            tracker_position_fallback = {
+                "HipsTracker": "Hips",
+                "ChestTracker": "Chest",
+                "LeftFootTracker": "LeftFoot",
+                "RightFootTracker": "RightFoot",
+                "LeftKneeTracker": "LeftUpperLeg",
+                "RightKneeTracker": "RightUpperLeg",
+                "LeftElbowTracker": "LeftUpperArm",
+                "RightElbowTracker": "RightUpperArm",
+            }
+            tracker_rotation_bone = {
+                "HipsTracker": "Hips",
+                "ChestTracker": "Chest",
+                "LeftFootTracker": "LeftFoot",
+                "RightFootTracker": "RightFoot",
+                "LeftKneeTracker": "LeftLowerLeg",
+                "RightKneeTracker": "RightLowerLeg",
+                "LeftElbowTracker": "LeftLowerArm",
+                "RightElbowTracker": "RightLowerArm",
+            }
 
-        for bone_name, tracker_id in osc_tracker_map.items():
-            # 检查该身体部位的传输开关
-            if not self._tracker_toggles.get(bone_name, True):
-                continue
+            for bone_name, tracker_id in osc_tracker_map.items():
+                toggle_bone = tracker_toggle_bone.get(bone_name, bone_name)
+                if not self._tracker_toggles.get(toggle_bone, True):
+                    continue
 
-            # 发送位置 (仅当位置开关开启时)
-            if self._send_position:
-                pos = unity_pose.get(bone_name, [0, 0, 0])
-                pos_addr = f"/tracking/trackers/{tracker_id}/position"
-                message = self._build_osc_message(
-                    pos_addr, float(pos[0]), float(pos[1]), float(pos[2])
-                )
-                self._osc_socket.sendto(message, (self.host, self.port))
+                if self._send_position:
+                    fallback_bone = tracker_position_fallback.get(bone_name, bone_name)
+                    pos = unity_pose.get(bone_name, unity_pose.get(fallback_bone, [0, 0, 0]))
+                    pos_addr = f"/tracking/trackers/{tracker_id}/position"
+                    message = self._build_osc_message(
+                        pos_addr, float(pos[0]), float(pos[1]), float(pos[2])
+                    )
+                    self._osc_socket.sendto(message, (self.host, self.port))
 
-            # 发送旋转 (仅当旋转开关开启时)
-            if self._send_rotation:
-                euler_deg = unity_rotations.get(bone_name, [0, 0, 0])
-                rot_addr = f"/tracking/trackers/{tracker_id}/rotation"
-                message = self._build_osc_message(
-                    rot_addr, float(euler_deg[0]), float(euler_deg[1]), float(euler_deg[2])
-                )
-                self._osc_socket.sendto(message, (self.host, self.port))
+                if self._send_rotation:
+                    rotation_bone = tracker_rotation_bone.get(bone_name, bone_name)
+                    euler_deg = unity_rotations.get(rotation_bone, [0, 0, 0])
+                    rot_addr = f"/tracking/trackers/{tracker_id}/rotation"
+                    message = self._build_osc_message(
+                        rot_addr, float(euler_deg[0]), float(euler_deg[1]), float(euler_deg[2])
+                    )
+                    self._osc_socket.sendto(message, (self.host, self.port))
 
         # ===== 头部数据发送 =====
         # 头部位置始终为原点 [0, 0, 0]，避免干扰 VR 头显的激光测距定位
@@ -1033,6 +1065,15 @@ class VRCTransmitter:
                 osc_address = f"/avatar/parameters/{param_name}"
                 value = max(-1.0, min(1.0, float(value)))
                 messages.append(self._build_osc_message(osc_address, value))
+            for param_name, osc_address in {
+                "v2/EyeClosedLeft": "/avatar/parameters/EyeLeftClosed",
+                "v2/EyeClosedRight": "/avatar/parameters/EyeRightClosed",
+                "v2/EyeOpenLeft": "/avatar/parameters/EyeOpenLeft",
+                "v2/EyeOpenRight": "/avatar/parameters/EyeOpenRight",
+            }.items():
+                if param_name in vrcft:
+                    value = max(0.0, min(1.0, float(vrcft[param_name])))
+                    messages.append(self._build_osc_message(osc_address, value))
             # 一次性发送所有消息
             sendto = self._osc_socket.sendto
             for msg in messages:
