@@ -8,6 +8,12 @@ dist/
 build/
 *.whl
 
+# Electron
+electron_frontend/node_modules/
+electron_frontend/dist/
+electron_frontend/.cache/
+electron_frontend/package-lock.json
+
 # PyInstaller
 *.spec.bak
 *.manifest
@@ -15,6 +21,7 @@ build/
 # 虚拟环境
 venv/
 .venv/
+.venv-lite/
 env/
 
 # IDE
@@ -55,3 +62,7 @@ YOLO26n-VRC-Mocap_*/
 
 # OneDrive 备份
 *.backup
+
+# 运行时状态与下载缓存
+state/
+tools/*.exe

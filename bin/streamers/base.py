@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Dict, Optional
 from abc import ABC, abstractmethod
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 
 class BaseStreamer(ABC):
@@ -30,14 +30,18 @@ class BaseStreamer(ABC):
         self.host = host
         self.port = port
 
-        # 推流开关 (独立于推理开关，由 StreamManager 统一管理)
+        # 推流开关独立于推理开关，由各运行时模块管理。
         self._enabled = True
         # 推理开关 (控制是否接收推理数据)
         self._inference_enabled = True
 
         self._connected = False
         self._running = False
-        self._send_queue = Queue(maxsize=10)
+        # Realtime pose output must not build latency. Keep only the newest
+        # pending pose while the sender thread is busy.
+        self._send_queue = Queue(maxsize=1)
+        self._queue_lock = threading.Lock()
+        self._connection_lock = threading.RLock()
         self._send_thread = None
 
         # HMD 位姿数据提供者 (用于坐标对齐)
@@ -46,6 +50,7 @@ class BaseStreamer(ABC):
         # 统计
         self._send_count = 0
         self._error_count = 0
+        self._drop_count = 0
         self._fps = 0
         self._fps_counter = 0
         self._fps_start_time = time.time()
@@ -78,30 +83,35 @@ class BaseStreamer(ABC):
 
     def connect(self) -> bool:
         """建立连接并启动发送线程"""
-        if self._connected:
-            return True
-        try:
-            if self._do_connect():
-                self._connected = True
-                self._running = True
-                self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
-                self._send_thread.start()
+        with self._connection_lock:
+            if self._connected:
                 return True
-        except Exception as e:
-            print(f"[{self.name}] Connect error: {e}")
-        return False
+            self._clear_send_queue()
+            try:
+                if self._do_connect():
+                    self._connected = True
+                    self._running = True
+                    self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
+                    self._send_thread.start()
+                    return True
+            except Exception as e:
+                print(f"[{self.name}] Connect error: {e}")
+            return False
 
     def disconnect(self):
         """断开连接"""
-        self._running = False
-        if self._send_thread:
-            self._send_thread.join(timeout=2.0)
-            self._send_thread = None
-        try:
-            self._do_disconnect()
-        except Exception:
-            pass
-        self._connected = False
+        with self._connection_lock:
+            self._running = False
+            self._connected = False
+            if self._send_thread:
+                if self._send_thread is not threading.current_thread():
+                    self._send_thread.join(timeout=2.0)
+                self._send_thread = None
+            self._clear_send_queue()
+            try:
+                self._do_disconnect()
+            except Exception:
+                pass
 
     def send(self, pose_data: Dict) -> bool:
         """将数据放入发送队列
@@ -111,16 +121,37 @@ class BaseStreamer(ABC):
         """
         if not self._inference_enabled:
             return False
-        try:
-            if self._send_queue.full():
+        with self._queue_lock:
+            try:
+                stale_pose = self._send_queue.get_nowait()
+            except Empty:
+                stale_pose = None
+            if stale_pose is not None:
+                self._drop_count += 1
+            try:
+                self._send_queue.put_nowait(pose_data)
+                return True
+            except Full:
+                # Producers are serialized, so this is defensive. Treat an
+                # unexpected contention as a rejected realtime pose.
+                self._drop_count += 1
+                return False
+
+    def _clear_send_queue(self) -> int:
+        dropped = 0
+        with self._queue_lock:
+            while True:
                 try:
                     self._send_queue.get_nowait()
                 except Empty:
-                    pass
-            self._send_queue.put(pose_data)
-            return True
-        except Exception:
-            return False
+                    break
+                dropped += 1
+            self._drop_count += dropped
+        return dropped
+
+    def _record_drop(self):
+        with self._queue_lock:
+            self._drop_count += 1
 
     def _send_loop(self):
         """发送线程主循环"""
@@ -132,8 +163,13 @@ class BaseStreamer(ABC):
                 except Empty:
                     continue
 
+                if not self._running:
+                    self._record_drop()
+                    break
+
                 # 推流开关控制: 未启用则丢弃数据
                 if not self._enabled:
+                    self._record_drop()
                     _consecutive_skip_count += 1
                     if _consecutive_skip_count == 1:
                         print(f"[{self.name}] WARNING: 推流已关闭，数据被丢弃 (inference_enabled={self._inference_enabled})")
@@ -141,6 +177,7 @@ class BaseStreamer(ABC):
 
                 # 未连接则尝试重连
                 if not self._connected:
+                    self._record_drop()
                     _consecutive_skip_count += 1
                     if _consecutive_skip_count == 1:
                         print(f"[{self.name}] WARNING: 未连接，数据被丢弃 (enabled={self._enabled}, inference_enabled={self._inference_enabled})")
@@ -171,6 +208,9 @@ class BaseStreamer(ABC):
 
     def get_status(self) -> Dict:
         """获取推流模块状态"""
+        with self._queue_lock:
+            drop_count = self._drop_count
+            queue_size = self._send_queue.qsize()
         return {
             "name": self.name,
             "enabled": self._enabled,
@@ -179,6 +219,9 @@ class BaseStreamer(ABC):
             "fps": self._fps,
             "send_count": self._send_count,
             "error_count": self._error_count,
+            "drop_count": drop_count,
+            "queue_size": queue_size,
+            "queue_capacity": self._send_queue.maxsize,
         }
 
     @abstractmethod

@@ -5,11 +5,17 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'bin'))
 
-results = []
+from edition import current_edition, yolo_available  # noqa: E402
 
-def test_step(name, func):
+
+def run_check(results, name, func):
+    if getattr(func, "full_only", False) and not yolo_available():
+        results.append((name, 'SKIP', 'lite edition (no YOLO/PyTorch)'))
+        return
     try:
         result = func()
+        if result is False:
+            raise AssertionError("check returned False")
         results.append((name, 'PASS', str(result)))
     except Exception as e:
         results.append((name, 'FAIL', str(e)[:120]))
@@ -43,13 +49,15 @@ def check_ultralytics():
 
 # 6. Import core modules
 def check_imports():
-    from yolo_detector import YOLO26nDetector
+    if yolo_available():
+        from yolo_detector import YOLO26nDetector  # noqa: F401
     from pose_estimator import PoseEstimator
-    from vrc_transmitter import VRCTransmitter
     from camera_capture import CameraCapture, ImageProcessor
     from face_landmark import FaceLandmarkDetector
     from hand_tracker import HandTracker
-    return "All 6 core modules imported"
+    from modules import BodyModule, FaceModule, HandModule
+    from streamers import BodyOSCStreamer, BodySteamVRStreamer, FaceVMCStreamer, HandVMTStreamer
+    return "Runtime detectors, modules, and streamers imported"
 
 # 7. Check YOLO model file
 def check_model():
@@ -62,14 +70,14 @@ def check_model():
     trained = glob.glob(os.path.join(os.path.dirname(__file__), 'runs', '**', 'best.pt'), recursive=True)
     if trained:
         return f"No base model, found trained: {trained[0]}"
-    return "No model file found"
+    raise FileNotFoundError("No runtime pose model file found")
 
 # 8. Check YOLO model loading
 def check_yolo_load():
     from ultralytics import YOLO
     model_path = os.path.join(os.path.dirname(__file__), 'yolo26n-pose.pt')
     if not os.path.exists(model_path):
-        return "Skipped - model file not found"
+        raise FileNotFoundError(model_path)
     model = YOLO(model_path)
     return f"Model loaded: {model.task}"
 
@@ -80,25 +88,35 @@ def check_pose_estimator():
                        one_euro_min_cutoff=1.0, one_euro_beta=0.007)
     return f"PoseEstimator initialized, keypoint_count={pe.num_keypoints if hasattr(pe, 'num_keypoints') else 'N/A'}"
 
-# 10. Test VRCTransmitter initialization
-def check_vrc_transmitter():
-    from vrc_transmitter import VRCTransmitter
-    vt = VRCTransmitter(host='127.0.0.1', port=9000, protocol='osc')
-    return f"VRCTransmitter initialized (protocol={vt.protocol})"
+# 10. Test current body OSC streamer initialization
+def check_body_streamer():
+    from streamers.body_osc import BodyOSCStreamer
+    streamer = BodyOSCStreamer(host='127.0.0.1', port=9000)
+    return f"BodyOSCStreamer initialized ({streamer.host}:{streamer.port})"
 
 # 11. Test FaceLandmarkDetector
 def check_face_detector():
     from face_landmark import FaceLandmarkDetector
     fd = FaceLandmarkDetector()
-    loaded = fd.load()
-    return f"FaceLandmarkDetector loaded={loaded}"
+    try:
+        loaded = fd.load()
+        if not loaded:
+            raise RuntimeError("FaceLandmarkDetector model failed to load")
+        return f"FaceLandmarkDetector loaded={loaded}"
+    finally:
+        fd.release()
 
 # 12. Test HandTracker
 def check_hand_tracker():
     from hand_tracker import HandTracker
     ht = HandTracker(max_num_hands=2)
-    loaded = ht.load()
-    return f"HandTracker loaded={loaded}"
+    try:
+        loaded = ht.load()
+        if not loaded:
+            raise RuntimeError("HandTracker model failed to load")
+        return f"HandTracker loaded={loaded}"
+    finally:
+        ht.release()
 
 # 13. Test config loading
 def check_config():
@@ -109,8 +127,8 @@ def check_config():
 
 # 14. Check Flask
 def check_flask():
-    import flask
-    return f"flask {flask.__version__}"
+    from importlib.metadata import version
+    return f"flask {version('flask')}"
 
 # 15. Check python-osc
 def check_pythonosc():
@@ -127,49 +145,71 @@ def check_scipy():
     import scipy
     return f"scipy {scipy.__version__}"
 
-# 18. Check sample dataset
-def check_sample_dataset():
-    ds_path = os.path.join(os.path.dirname(__file__), 'sample_dataset', 'dataset.yaml')
-    if os.path.exists(ds_path):
-        return "sample_dataset found"
-    return "sample_dataset not found"
+# 18. Check runtime model directory
+def check_runtime_models():
+    models_dir = os.path.join(os.path.dirname(__file__), 'models')
+    available = []
+    for root in [os.path.dirname(__file__), models_dir]:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if os.path.splitext(name)[1].lower() in {'.pt', '.onnx', '.engine'}:
+                available.append(name)
+    if available:
+        return f"Runtime models: {', '.join(sorted(set(available))[:5])}"
+    raise FileNotFoundError("No runtime .pt/.onnx/.engine model found")
 
-# Run all tests
-test_step("Python", check_python)
-test_step("PyTorch", check_torch)
-test_step("OpenCV", check_opencv)
-test_step("NumPy", check_numpy)
-test_step("Ultralytics", check_ultralytics)
-test_step("Flask", check_flask)
-test_step("python-osc", check_pythonosc)
-test_step("MediaPipe", check_mediapipe)
-test_step("SciPy", check_scipy)
-test_step("Core Imports", check_imports)
-test_step("YOLO Model File", check_model)
-test_step("YOLO Model Load", check_yolo_load)
-test_step("PoseEstimator", check_pose_estimator)
-test_step("VRCTransmitter", check_vrc_transmitter)
-test_step("FaceLandmarkDetector", check_face_detector)
-test_step("HandTracker", check_hand_tracker)
-test_step("Config Loading", check_config)
-test_step("Sample Dataset", check_sample_dataset)
+def main():
+    results = []
+    checks = [
+        ("Python", check_python),
+        ("PyTorch", check_torch),
+        ("OpenCV", check_opencv),
+        ("NumPy", check_numpy),
+        ("Ultralytics", check_ultralytics),
+        ("Flask", check_flask),
+        ("python-osc", check_pythonosc),
+        ("MediaPipe", check_mediapipe),
+        ("SciPy", check_scipy),
+        ("Core Imports", check_imports),
+        ("YOLO Model File", check_model),
+        ("YOLO Model Load", check_yolo_load),
+        ("PoseEstimator", check_pose_estimator),
+        ("Body OSC Streamer", check_body_streamer),
+        ("FaceLandmarkDetector", check_face_detector),
+        ("HandTracker", check_hand_tracker),
+        ("Config Loading", check_config),
+        ("Runtime Models", check_runtime_models),
+    ]
+    for check in (check_torch, check_ultralytics, check_model, check_yolo_load, check_runtime_models):
+        check.full_only = True
+    checks.insert(1, ("Edition", lambda: f"{current_edition()} edition"))
+    for name, check in checks:
+        run_check(results, name, check)
 
-# Print results
-print()
-print('=' * 70)
-print('  YOLO26n VRC Mocap - System Test Results')
-print('=' * 70)
-print(f'{"Test":<25s} | {"Status":6s} | Detail')
-print('-' * 70)
-pass_count = 0
-fail_count = 0
-for name, status, detail in results:
-    icon = 'OK' if status == 'PASS' else '!!'
-    if status == 'PASS':
-        pass_count += 1
-    else:
-        fail_count += 1
-    print(f'{name:<25s} | {icon:<6s} | {detail}')
-print('-' * 70)
-print(f'Total: {len(results)} tests | PASSED: {pass_count} | FAILED: {fail_count}')
-print('=' * 70)
+    print()
+    print('=' * 70)
+    print('  YOLO26n VRC Mocap - System Test Results')
+    print('=' * 70)
+    print(f'{"Test":<25s} | {"Status":6s} | Detail')
+    print('-' * 70)
+    pass_count = 0
+    fail_count = 0
+    skip_count = 0
+    for name, status, detail in results:
+        icon = {'PASS': 'OK', 'SKIP': '--'}.get(status, '!!')
+        if status == 'PASS':
+            pass_count += 1
+        elif status == 'SKIP':
+            skip_count += 1
+        else:
+            fail_count += 1
+        print(f'{name:<25s} | {icon:<6s} | {detail}')
+    print('-' * 70)
+    print(f'Total: {len(results)} tests | PASSED: {pass_count} | SKIPPED: {skip_count} | FAILED: {fail_count}')
+    print('=' * 70)
+    return 1 if fail_count else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

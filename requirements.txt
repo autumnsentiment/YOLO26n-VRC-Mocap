@@ -1,11 +1,13 @@
-ultralytics>=8.3.0
-torch>=2.0.0
-torchvision>=0.15.0
-opencv-python>=4.8.0
-mediapipe>=0.10.0
-numpy>=1.24.0
-scipy>=1.10.0
-flask>=3.0.0
-python-osc>=1.8.0
-PyYAML>=6.0
-matplotlib>=3.7.0
+# Pip fallback only; pyproject.toml and uv.lock are the source of truth.
+# Lite edition: pip install -r requirements.txt
+# Full edition: pip install -r requirements.txt -r requirements-full.txt --extra-index-url https://download.pytorch.org/whl/cu128
+opencv-python==4.13.0.92
+opencv-contrib-python==4.13.0.92
+mediapipe==0.10.33
+numpy==2.4.4
+scipy==1.17.1
+flask==3.1.0
+python-osc==1.10.2
+PyYAML==6.0.3
+psutil==7.2.2
+openvr==2.12.1401

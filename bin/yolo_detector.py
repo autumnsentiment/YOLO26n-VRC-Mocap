@@ -5,9 +5,11 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 import threading
 import time
+from collections import deque
+from runtime_paths import runtime_root
 
 # 将 Ultralytics 配置目录设到项目下，避免 AppData 权限问题
-_ultra_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ultralytics")
+_ultra_cfg = str(runtime_root() / ".ultralytics")
 os.makedirs(_ultra_cfg, exist_ok=True)
 os.environ["ULTRALYTICS_SETTINGS"] = _ultra_cfg
 
@@ -49,7 +51,7 @@ class YOLO26nDetector:
         self.model_path = model_path
         self.is_loaded = False
         self.lock = threading.Lock()
-        self.fps_history = []
+        self.fps_history = deque(maxlen=60)
         self.warmup_done = False
 
         # 自动选择设备
@@ -61,6 +63,10 @@ class YOLO26nDetector:
         # CPU 不支持 FP16/INT8，回退到 FP32
         if self.device == "cpu":
             self.precision = "fp32"
+            self.half = False
+        elif self.precision == "fp16":
+            self.half = True
+        else:
             self.half = False
 
     def load_model(self, model_path: Optional[str] = None) -> bool:
@@ -75,23 +81,20 @@ class YOLO26nDetector:
 
             # 根据精度设置应用量化
             if self.precision == "int8" and self.device == "cuda":
+                # torch dynamic quantization is CPU-only and skips Conv layers,
+                # so it gives no real INT8 on CUDA. Real INT8 needs a TensorRT
+                # export (model.export(format="engine", int8=True)).
+                print("INT8 is not available for PyTorch CUDA weights; using FP16")
+                self.precision = "fp16"
+                self.half = True
                 self.model.model.half()
-                try:
-                    self.model.model = torch.quantization.quantize_dynamic(
-                        self.model.model, {torch.nn.Linear}, dtype=torch.qint8
-                    )
-                    print("INT8 quantization enabled (dynamic)")
-                except Exception as qe:
-                    print(f"INT8 quantization failed, falling back to FP16: {qe}")
-                    self.precision = "fp16"
-                    self.model = YOLO(path)
-                    self.model.to(self.device)
-                    self.model.model.half()
             elif self.precision == "fp16" and self.device == "cuda":
+                self.half = True
                 self.model.model.half()
                 print("FP16 half-precision enabled")
             else:
                 self.precision = "fp32"
+                self.half = False
                 print("FP32 full-precision mode")
 
             self.is_loaded = True
@@ -103,15 +106,19 @@ class YOLO26nDetector:
             self.is_loaded = False
             return False
 
-    def warmup(self, imgsz: int = 640) -> None:
+    def warmup(self, imgsz: int = 640, shape: Optional[Tuple[int, int]] = None) -> None:
         """预热模型，消除首帧延迟"""
         if self.warmup_done or not self.is_loaded:
             return
 
         try:
             print("Warming up model...")
-            dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
-            self.model(dummy, verbose=False, device=self.device)
+            height, width = shape if shape else (imgsz, imgsz)
+            dummy = np.zeros((int(height), int(width), 3), dtype=np.uint8)
+            # Same half/conf flags as detect() so the first real frame does not
+            # trigger another CUDA kernel selection pass.
+            self.model(dummy, conf=self.conf_threshold, verbose=False,
+                       device=self.device, half=self.half)
             self.warmup_done = True
             print("Warmup complete")
         except Exception as e:
@@ -123,7 +130,7 @@ class YOLO26nDetector:
                 return self._empty_result()
 
             if not self.warmup_done:
-                self.warmup(frame.shape[0])
+                self.warmup(shape=frame.shape[:2])
 
             start_time = time.perf_counter()
 
@@ -140,8 +147,6 @@ class YOLO26nDetector:
             current_fps = 1.0 / processing_time if processing_time > 0 else 0
 
             self.fps_history.append(current_fps)
-            if len(self.fps_history) > 60:
-                self.fps_history.pop(0)
             avg_fps = sum(self.fps_history) / len(self.fps_history)
 
             return self._parse_results(results, avg_fps)

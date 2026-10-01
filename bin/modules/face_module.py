@@ -17,6 +17,7 @@ from .base_module import BaseModule
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from face_calibration import write_face_state
 from face_landmark import FaceLandmarkDetector
 from streamers.face_vmc import FaceVMCStreamer
 
@@ -36,6 +37,7 @@ class FaceModule(BaseModule):
         self._detector = None
         self._streamer = None
         self._low_light_mode = False
+        self._last_state_write = 0.0
 
     def _do_initialize(self) -> bool:
         """初始化面部检测器和推流器"""
@@ -52,6 +54,15 @@ class FaceModule(BaseModule):
             head_position_scale=self._config.get("head_position_scale", 1.0),
             head_position_offset=self._config.get("head_position_offset", [0, 0, 0]),
             head_rotation_smoothing=self._config.get("head_rotation_smoothing", 0.3),
+            vrcft_calibration=self._config.get("vrcft_calibration", {}),
+            model_path=self._config.get("model_path"),
+            mouth_shape_mapping_enabled=self._config.get("mouth_shape_mapping_enabled", True),
+            mouth_shape_gain=self._config.get("mouth_shape_gain", 1.25),
+            mouth_shape_deadzone=self._config.get("mouth_shape_deadzone", 0.03),
+            eyelid_independent_enabled=self._config.get("eyelid_independent_enabled", True),
+            eyelid_close_gain=self._config.get("eyelid_close_gain", 1.35),
+            eyelid_close_deadzone=self._config.get("eyelid_close_deadzone", 0.04),
+            eyelid_send_combined=self._config.get("eyelid_send_combined", False),
         )
         if not self._detector.load():
             print("[face] MediaPipe FaceLandmarker 加载失败")
@@ -86,6 +97,10 @@ class FaceModule(BaseModule):
         face_data = self._detector.detect(frame)
         if face_data is None:
             return None
+        if not self._detector.last_result_fresh:
+            return face_data
+
+        self._write_latest_vrcft_state(face_data)
 
         # 推流: body 关闭时 face streamer 接管头部追踪
         if self._streaming_enabled and self._streamer and self._streamer.connected:
@@ -94,11 +109,19 @@ class FaceModule(BaseModule):
 
         return face_data
 
+    def process(self, frame) -> Optional[Dict]:
+        face_data = super().process(frame)
+        if self._detector and not self._detector.last_result_fresh:
+            self._last_result_fresh = False
+        return face_data
+
     def _do_cleanup(self):
         """释放资源"""
         if self._streamer:
             self._streamer.disconnect()
             self._streamer = None
+        if self._detector:
+            self._detector.release()
         self._detector = None
 
     def calibrate(self, face_data: Dict):
@@ -122,6 +145,7 @@ class FaceModule(BaseModule):
         """模块启用回调"""
         if self._streamer:
             self._streamer.inference_enabled = True
+            self._streamer.enabled = self._streaming_enabled
             if self._streaming_enabled and not self._streamer.connected:
                 self._streamer.connect()
 
@@ -136,6 +160,19 @@ class FaceModule(BaseModule):
     def update_config(self, config: Dict, streaming_config: Dict):
         """热更新配置"""
         super().update_config(config, streaming_config)
+        if self._detector:
+            self._detector.update_vrcft_calibration(self._config.get("vrcft_calibration", {}))
+            self._detector.update_mouth_shape_mapping(
+                enabled=self._config.get("mouth_shape_mapping_enabled", True),
+                gain=self._config.get("mouth_shape_gain", 1.25),
+                deadzone=self._config.get("mouth_shape_deadzone", 0.03),
+            )
+            self._detector.update_eyelid_mapping(
+                enabled=self._config.get("eyelid_independent_enabled", True),
+                gain=self._config.get("eyelid_close_gain", 1.35),
+                deadzone=self._config.get("eyelid_close_deadzone", 0.04),
+                send_combined=self._config.get("eyelid_send_combined", False),
+            )
         if self._streamer:
             self._streamer.inference_enabled = self._enabled
             self._streamer.enabled = self._streaming_enabled
@@ -146,3 +183,20 @@ class FaceModule(BaseModule):
             status["connected"] = self._streamer.connected
             status["streamer_fps"] = self._streamer._fps
         return status
+
+    def _write_latest_vrcft_state(self, face_data: Dict):
+        vrcft_raw = face_data.get("vrcft_raw")
+        if not vrcft_raw:
+            return
+
+        import time
+
+        now = time.time()
+        if now - self._last_state_write < 0.2:
+            return
+        self._last_state_write = now
+        try:
+            write_face_state(vrcft_raw)
+        except Exception as e:
+            if self._detect_count <= 3:
+                print(f"[face] VRCFT state write failed: {e}")

@@ -1,0 +1,33 @@
+{
+  "name": "yolo26n-vrc-mocap-electron",
+  "version": "1.0.0",
+  "description": "Electron desktop shell for YOLO26n VRC Mocap Dashboard",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win portable",
+    "build:dir": "electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "^31.7.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.yolo26n.vrcmocap.ui",
+    "productName": "YOLO26n-VRC-Mocap-Electron",
+    "forceCodeSigning": false,
+    "directories": {
+      "output": "../dist/electron"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "sign": false,
+      "target": [
+        "portable"
+      ]
+    }
+  }
+}

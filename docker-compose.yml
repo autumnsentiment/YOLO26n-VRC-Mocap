@@ -1,0 +1,28 @@
+services:
+  yolo26n-vrc-mocap:
+    build:
+      context: .
+      args:
+        # full or lite; lite skips PyTorch/YOLO
+        EDITION: ${YOLO26N_EDITION:-full}
+    image: yolo26n-vrc-mocap:${YOLO26N_EDITION:-full}
+    container_name: yolo26n-vrc-mocap
+    ports:
+      - "8765:8765"
+      - "9000:9000/udp"
+      - "9001:9001/udp"
+      - "39539:39539/udp"
+      - "39540:39540/udp"
+      - "39541:39541/udp"
+      - "39570:39570/udp"
+      - "4243:4243/udp"
+    environment:
+      YOLO26N_HOST: "0.0.0.0"
+      YOLO26N_PORT: "8765"
+      YOLO26N_EDITION: ${YOLO26N_EDITION:-full}
+    volumes:
+      - ./config:/app/config
+      - ./runs:/app/runs
+    devices:
+      - /dev/video0:/dev/video0
+    restart: unless-stopped

@@ -58,6 +58,8 @@ class StreamManager:
         send_position = body_cfg.get("send_position", True)
         send_rotation = body_cfg.get("send_rotation", True)
         send_head_position = body_cfg.get("send_head_position", False)
+        decouple_from_hmd = body_cfg.get("decouple_from_hmd", False)
+        hmd_height_scaling = body_cfg.get("hmd_height_scaling", {})
 
         # 读取 SteamVR 子配置
         steamvr_cfg = body_cfg.get("steamvr", {})
@@ -74,6 +76,8 @@ class StreamManager:
                 hmd_to_neck_offset=hmd_to_neck_offset,
                 trackers=steamvr_cfg.get("trackers", None),
                 tracker_toggles=tracker_toggles,
+                decouple_from_hmd=decouple_from_hmd,
+                hmd_height_scaling=hmd_height_scaling,
             )
         else:
             body_streamer = BodyOSCStreamer(
@@ -83,7 +87,9 @@ class StreamManager:
                 send_position=send_position,
                 send_rotation=send_rotation,
                 send_head_position=send_head_position,
+                decouple_from_hmd=decouple_from_hmd,
                 hmd_to_neck_offset=hmd_to_neck_offset,
+                hmd_height_scaling=hmd_height_scaling,
             )
 
         self._streamers["body"] = body_streamer
@@ -93,8 +99,23 @@ class StreamManager:
         hand_streamer = HandVMTStreamer(
             host=host,
             port=port,
+            vmt_host=hand_cfg.get("vmt_host", host),
             vmt_port=hand_cfg.get("vmt_port", 39570),
             hmd_to_neck_offset=hmd_to_neck_offset,
+            desktop_osc_enabled=hand_cfg.get("desktop_osc_enabled", True),
+            vmt_enabled=hand_cfg.get("vmt_enabled", True),
+            vmt_local_mode=hand_cfg.get("vmt_local_mode", True),
+            vmt_skeleton_enabled=hand_cfg.get("vmt_skeleton_enabled", True),
+            vmt_input_enabled=hand_cfg.get("vmt_input_enabled", True),
+            vmt_auto_enable_skeleton=hand_cfg.get(
+                "vmt_auto_enable_skeleton", True
+            ),
+            vmt_left_device_index=hand_cfg.get("vmt_left_device_index", 1),
+            vmt_right_device_index=hand_cfg.get("vmt_right_device_index", 2),
+            custom_parameters_enabled=hand_cfg.get("custom_parameters_enabled", True),
+            lost_reset_timeout=hand_cfg.get("lost_reset_timeout", 0.35),
+            desktop_left_gesture_parameters=hand_cfg.get("desktop_left_gesture_parameters"),
+            desktop_right_gesture_parameters=hand_cfg.get("desktop_right_gesture_parameters"),
         )
         self._streamers["hand"] = hand_streamer
 

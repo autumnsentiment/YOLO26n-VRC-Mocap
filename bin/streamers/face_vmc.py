@@ -36,19 +36,42 @@ class FaceVMCStreamer(BaseStreamer):
     VRCFT_TO_VMC_BLENDSHAPE = {
         "v2/MouthOpen": "mouth_open",
         "v2/MouthSmile": "mouth_smile",
+        "v2/MouthFrown": "mouth_frown",
+        "v2/MouthPress": "mouth_press",
+        "v2/MouthStretch": "mouth_stretch",
+        "v2/MouthDimple": "mouth_dimple",
+        "v2/EyeClosed": "eye_closed",
+        "v2/EyeClosedLeft": "eye_closed_l",
+        "v2/EyeClosedRight": "eye_closed_r",
+        "v2/EyeLid": "eye_lid",
+        "v2/EyeLidLeft": "eye_lid_l",
+        "v2/EyeLidRight": "eye_lid_r",
         "v2/EyeOpenLeft": "eye_open_l",
         "v2/EyeOpenRight": "eye_open_r",
+        "v2/EyeOpen": "eye_open",
         "v2/BrowInnerUpLeft": "brow_inner_up_l",
         "v2/BrowInnerUpRight": "brow_inner_up_r",
         "v2/JawOpen": "jaw_open",
-        "v2/MouthFunnel": "mouth_funnel",
-        "v2/MouthPucker": "mouth_pucker",
-        "v2/MouthLeft": "mouth_left",
-        "v2/MouthRight": "mouth_right",
+        "v2/JawX": "jaw_x",
+        "v2/LipFunnel": "lip_funnel",
+        "v2/LipPucker": "lip_pucker",
+        "v2/MouthX": "mouth_x",
+        "v2/MouthSmileLeft": "mouth_smile_l",
+        "v2/MouthSmileRight": "mouth_smile_r",
+        "v2/MouthFrownLeft": "mouth_frown_l",
+        "v2/MouthFrownRight": "mouth_frown_r",
+        "v2/MouthDimpleLeft": "mouth_dimple_l",
+        "v2/MouthDimpleRight": "mouth_dimple_r",
+        "v2/MouthPressLeft": "mouth_press_l",
+        "v2/MouthPressRight": "mouth_press_r",
+        "v2/MouthStretchLeft": "mouth_stretch_l",
+        "v2/MouthStretchRight": "mouth_stretch_r",
         "v2/MouthLowerDownLeft": "mouth_lower_down_l",
         "v2/MouthLowerDownRight": "mouth_lower_down_r",
         "v2/MouthUpperUpLeft": "mouth_upper_up_l",
         "v2/MouthUpperUpRight": "mouth_upper_up_r",
+        "v2/MouthRaiserLower": "mouth_raiser_lower",
+        "v2/MouthRaiserUpper": "mouth_raiser_upper",
         "v2/EyeSquintLeft": "eye_squint_l",
         "v2/EyeSquintRight": "eye_squint_r",
         "v2/EyeWideLeft": "eye_wide_l",
@@ -201,6 +224,7 @@ class FaceVMCStreamer(BaseStreamer):
                 osc_address = f"/avatar/parameters/{param_name}"
                 value = max(-1.0, min(1.0, float(value)))
                 messages.append(OSCTransport.build_message(osc_address, value))
+            messages.extend(self._build_eye_alias_messages(vrcft))
             self._osc.send_batch(messages)
             return
 
@@ -222,6 +246,22 @@ class FaceVMCStreamer(BaseStreamer):
         ))
 
         self._osc.send_batch(messages)
+
+    def _build_eye_alias_messages(self, vrcft: Dict[str, float]) -> List[bytes]:
+        """Send legacy eye params alongside VRCFT for older avatars."""
+        aliases = []
+        alias_map = {
+            "v2/EyeClosedLeft": "/avatar/parameters/EyeLeftClosed",
+            "v2/EyeClosedRight": "/avatar/parameters/EyeRightClosed",
+            "v2/EyeOpenLeft": "/avatar/parameters/EyeOpenLeft",
+            "v2/EyeOpenRight": "/avatar/parameters/EyeOpenRight",
+        }
+        for param_name, osc_address in alias_map.items():
+            if param_name not in vrcft:
+                continue
+            value = max(0.0, min(1.0, float(vrcft[param_name])))
+            aliases.append(OSCTransport.build_message(osc_address, value))
+        return aliases
 
     def _send_vmc_face(self, face_data: Dict):
         """通过 VMC 协议发送面部 blendshape"""

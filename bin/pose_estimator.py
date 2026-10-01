@@ -2,6 +2,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from scipy.spatial.transform import Rotation as R
 import copy
+from collections import deque
 import math
 import time
 
@@ -25,23 +26,24 @@ class OneEuroFilter:
         self.t_prev = None
 
     def _smoothing_factor(self, cutoff: float) -> float:
-        r = 2 * math.pi * cutoff / self.freq
-        return 1.0 / (1.0 + r)
+        r = 2 * math.pi * max(0.0, cutoff) / self.freq
+        return r / (1.0 + r)
 
     def _exponential_smoothing(self, a: float, x: float, x_prev: float) -> float:
         return a * x + (1 - a) * x_prev
 
     def filter(self, x: float, t: Optional[float] = None) -> float:
         if self.t_prev is None:
-            self.t_prev = t or time.perf_counter()
+            self.t_prev = time.perf_counter() if t is None else t
             self.x_prev = x
             self.dx_prev = 0.0
             return x
 
-        t = t or time.perf_counter()
+        t = time.perf_counter() if t is None else t
         dt = t - self.t_prev
-        if dt <= 0:
-            dt = 1.0 / self.freq
+        if not math.isfinite(dt) or dt <= 0:
+            dt = 1.0 / max(self.freq, 1.0)
+        dt = min(max(dt, 1e-4), 1.0)
 
         self.freq = 1.0 / dt
 
@@ -120,6 +122,17 @@ class PoseEstimator:
         "RightHand": "RightLowerArm",
     }
 
+    TRACKER_POSE_SOURCES = {
+        "HipsTracker": "Hips",
+        "ChestTracker": "Chest",
+        "LeftFootTracker": "LeftFoot",
+        "RightFootTracker": "RightFoot",
+        "LeftKneeTracker": "LeftUpperLeg",
+        "RightKneeTracker": "RightUpperLeg",
+        "LeftElbowTracker": "LeftUpperArm",
+        "RightElbowTracker": "RightUpperArm",
+    }
+
     # 人体骨骼比例（基于标准人体测量学）
     BONE_LENGTHS = {
         "spine": 0.18,
@@ -138,17 +151,70 @@ class PoseEstimator:
     }
 
     def __init__(self, smoothing: str = "one_euro", smoothing_factor: float = 0.3,
-                 one_euro_min_cutoff: float = 1.0, one_euro_beta: float = 0.007):
+                 one_euro_min_cutoff: float = 1.0, one_euro_beta: float = 0.007,
+                 average_smoothing_enabled: bool = True,
+                 average_window: int = 4,
+                 ema_alpha: float = 0.35,
+                 reset_on_tracking_lost: bool = True):
         self.smoothing = smoothing
         self.smoothing_factor = smoothing_factor
         self.previous_pose = None
         self.previous_rotations = None
+        self.average_smoothing_enabled = average_smoothing_enabled
+        self.average_window = max(1, int(average_window))
+        self.ema_alpha = min(1.0, max(0.0, float(ema_alpha)))
+        self.reset_on_tracking_lost = reset_on_tracking_lost
+        self._pose_average_history: Dict[str, deque] = {}
+        self._pose_ema: Dict[str, List[float]] = {}
 
         # OneEuro 滤波器
         self.pose_filters: Dict[str, OneEuroFilterVec3] = {}
         self.rotation_filters: Dict[str, OneEuroFilterVec3] = {}
         self.one_euro_min_cutoff = one_euro_min_cutoff
         self.one_euro_beta = one_euro_beta
+        self._target_center = None
+        self._target_last_seen = None
+
+    @classmethod
+    def ensure_tracker_nodes(cls, pose_3d: Dict[str, List[float]]) -> Dict[str, List[float]]:
+        """Add explicit VRChat tracker nodes without changing the VRC bone tree."""
+        for tracker_name, source_name in cls.TRACKER_POSE_SOURCES.items():
+            if tracker_name not in pose_3d and source_name in pose_3d:
+                pose_3d[tracker_name] = [float(v) for v in pose_3d[source_name]]
+        return pose_3d
+
+    def _reset_average_smoothing(self):
+        self._pose_average_history.clear()
+        self._pose_ema.clear()
+
+    def apply_average_smoothing(self, pose_3d: Dict[str, List[float]]) -> Dict[str, List[float]]:
+        """Apply a short moving average plus EMA before the existing filter stage."""
+        if not self.average_smoothing_enabled:
+            return pose_3d
+
+        active = set(pose_3d.keys())
+        for joint in list(self._pose_average_history.keys()):
+            if joint not in active:
+                self._pose_average_history.pop(joint, None)
+                self._pose_ema.pop(joint, None)
+
+        smoothed = {}
+        for joint, coords in pose_3d.items():
+            values = [float(v) for v in coords]
+            history = self._pose_average_history.setdefault(joint, deque(maxlen=self.average_window))
+            history.append(values)
+            avg = [sum(frame[i] for frame in history) / len(history) for i in range(3)]
+
+            prev = self._pose_ema.get(joint)
+            if prev is None:
+                ema = avg
+            else:
+                alpha = self.ema_alpha
+                ema = [alpha * avg[i] + (1.0 - alpha) * prev[i] for i in range(3)]
+            self._pose_ema[joint] = ema
+            smoothed[joint] = ema.copy()
+
+        return smoothed
 
     def _get_pose_filter(self, joint: str) -> OneEuroFilterVec3:
         if joint not in self.pose_filters:
@@ -176,11 +242,85 @@ class PoseEstimator:
                     keypoints_dict[name] = (float(x), float(y), float(conf))
         return keypoints_dict
 
+    def _select_person(self, detections: Dict, image_width: int,
+                       image_height: int) -> Optional[int]:
+        now = time.perf_counter()
+        candidates = []
+        boxes = detections.get("boxes") or []
+        for index, points in enumerate(detections.get("keypoints") or []):
+            kps = self.keypoints_to_dict(points)
+            shoulders = [kps.get(side + "_shoulder") for side in ("left", "right")]
+            hips = [kps.get(side + "_hip") for side in ("left", "right")]
+            torso = [p for p in shoulders + hips if p is not None]
+            if len(shoulders) < 2 or any(p is None for p in shoulders):
+                continue
+            center = np.mean([(p[0] / max(image_width, 1),
+                               p[1] / max(image_height, 1)) for p in torso], axis=0)
+            if index < len(boxes) and len(boxes[index]) >= 4:
+                x0, y0, x1, y1 = boxes[index][:4]
+                area = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+            else:
+                visible = list(kps.values())
+                area = ((max(p[0] for p in visible) - min(p[0] for p in visible))
+                        * (max(p[1] for p in visible) - min(p[1] for p in visible)))
+            candidates.append((index, center, area))
+
+        if self._target_center is not None and candidates:
+            nearest = min(candidates, key=lambda item: np.linalg.norm(item[1] - self._target_center))
+            if np.linalg.norm(nearest[1] - self._target_center) <= 0.2:
+                self._target_center = nearest[1]
+                self._target_last_seen = now
+                return nearest[0]
+
+        if self._target_center is not None and self._target_last_seen is not None:
+            if now - self._target_last_seen < 0.5:
+                return None
+            self._target_center = None
+            self._target_last_seen = None
+            if self.reset_on_tracking_lost:
+                self.reset_filters()
+
+        if not candidates:
+            return None
+        selected = max(candidates, key=lambda item: item[2])
+        self._target_center = selected[1]
+        self._target_last_seen = now
+        return selected[0]
+
     def _midpoint(self, p1: Tuple, p2: Tuple) -> Tuple[float, float]:
         return ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
 
     def _distance_2d(self, p1: Tuple, p2: Tuple) -> float:
         return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+    def _unit_2d(self, dx: float, dy: float,
+                 fallback: Tuple[float, float] = (0.0, -1.0)) -> Tuple[float, float]:
+        length = math.sqrt(dx * dx + dy * dy)
+        if length < 1e-6:
+            return fallback
+        return (dx / length, dy / length)
+
+    def _synthetic_nose_from_upper_body(
+        self,
+        keypoints: Dict[str, Tuple[float, float, float]],
+        shoulder_mid: Tuple[float, float],
+        shoulder_dist: float,
+    ) -> Tuple[float, float, float]:
+        lh = keypoints.get("left_hip")
+        rh = keypoints.get("right_hip")
+        if lh and rh:
+            hip_mid = self._midpoint(lh, rh)
+            up_x, up_y = self._unit_2d(
+                shoulder_mid[0] - hip_mid[0],
+                shoulder_mid[1] - hip_mid[1],
+            )
+        else:
+            up_x, up_y = (0.0, -1.0)
+        return (
+            shoulder_mid[0] + up_x * shoulder_dist * 0.65,
+            shoulder_mid[1] + up_y * shoulder_dist * 0.65,
+            0.2,
+        )
 
     def normalize_keypoints(self, kps: Dict[str, Tuple[float, float, float]],
                            image_width: int = 640, image_height: int = 480,
@@ -291,10 +431,16 @@ class PoseEstimator:
 
         # ===== 头部 =====
         nose = kp("nose")
-        head_dir_2d = normalized_dir(
-            (ls[0] / 2 + rs[0] / 2, ls[1] / 2 + rs[1] / 2),
-            (nose[0], nose[1])
-        )
+        if norm_kps.get("nose") and nose[2] > 0.15:
+            head_dir_2d = normalized_dir(
+                (shoulder_center[0], shoulder_center[1]),
+                (nose[0], nose[1])
+            )
+        else:
+            head_dir_2d = normalized_dir(
+                (hip_center[0], hip_center[1]),
+                (shoulder_center[0], shoulder_center[1])
+            )
         head_dir_2d[2] = 0.0
         head_len = np.linalg.norm(head_dir_2d)
         if head_len < 1e-6:
@@ -391,7 +537,7 @@ class PoseEstimator:
         right_hand_pos = right_lower_arm_pos + right_hand_dir
         pose_3d["RightHand"] = right_hand_pos.tolist()
 
-        return pose_3d
+        return self.ensure_tracker_nodes(pose_3d)
 
     def calculate_rotations(self, pose_3d: Dict[str, List[float]]) -> Dict[str, List[float]]:
         """根据骨骼层级计算每个关节的局部旋转（欧拉角 XYZ，弧度）"""
@@ -476,7 +622,8 @@ class PoseEstimator:
     def process_detections(self, detections: Dict, image_width: int = 640,
                           image_height: int = 480,
                           hand_data: Dict = None,
-                          flip_horizontal: bool = True) -> Optional[Dict]:
+                          flip_horizontal: bool = True,
+                          apply_filters: bool = True) -> Optional[Dict]:
         """完整处理流程：2D关键点 -> 归一化 -> 3D姿态 -> 旋转 -> 平滑
 
         Args:
@@ -487,10 +634,11 @@ class PoseEstimator:
             flip_horizontal: 摄像头是否水平翻转图像
         """
         keypoints_list = detections.get("keypoints")
-        if keypoints_list is None or len(keypoints_list) == 0:
+        selected_index = self._select_person(detections, image_width, image_height)
+        if selected_index is None:
             return None
 
-        keypoints_array = keypoints_list[0]
+        keypoints_array = keypoints_list[selected_index]
         keypoints_dict = self.keypoints_to_dict(keypoints_array)
 
         # 推算缺失的髋部关键点（根据肩部位置）
@@ -506,6 +654,12 @@ class PoseEstimator:
                 keypoints_dict["left_hip"] = (shoulder_mid[0] - shoulder_dist * hip_width_ratio / 2, shoulder_mid[1] + hip_y_offset, 0.2)
             if "right_hip" not in keypoints_dict:
                 keypoints_dict["right_hip"] = (shoulder_mid[0] + shoulder_dist * hip_width_ratio / 2, shoulder_mid[1] + hip_y_offset, 0.2)
+            if "nose" not in keypoints_dict:
+                keypoints_dict["nose"] = self._synthetic_nose_from_upper_body(
+                    keypoints_dict,
+                    shoulder_mid,
+                    shoulder_dist,
+                )
 
         # 推算缺失的膝盖和脚踝关键点（根据髋部位置）
         lh = keypoints_dict.get("left_hip")
@@ -529,11 +683,15 @@ class PoseEstimator:
 
         # 至少需要4个关键点才能估计姿态
         if len(keypoints_dict) < 4:
+            if self.reset_on_tracking_lost:
+                self.reset_filters()
             return None
 
         # 检查关键关键点（放宽：有肩部即可推算髋部）
         required = ["left_shoulder", "right_shoulder"]
         if not all(keypoints_dict.get(r) for r in required):
+            if self.reset_on_tracking_lost:
+                self.reset_filters()
             return None
 
         normalized_kps = self.normalize_keypoints(keypoints_dict, image_width, image_height, flip_horizontal)
@@ -544,20 +702,24 @@ class PoseEstimator:
                                                           image_width, image_height)
 
         pose_3d = self.estimate_3d_pose(normalized_kps)
-        pose_3d = self.smooth_pose(pose_3d)
+        if apply_filters:
+            pose_3d = self.apply_average_smoothing(pose_3d)
+            pose_3d = self.smooth_pose(pose_3d)
         rotations = self.calculate_rotations(pose_3d)
 
         # 如果有手部追踪数据，用手掌旋转修正手臂到手掌的连接
         if hand_data:
             rotations = self._refine_arm_hand_rotations(rotations, hand_data)
 
-        rotations = self.smooth_rotations(rotations)
+        if apply_filters:
+            rotations = self.smooth_rotations(rotations)
 
         return {
             "pose_3d": pose_3d,
             "rotations": rotations,
             "keypoints_2d": keypoints_dict,
-            "confidence": detections.get("confidence", [0])[0] if detections.get("confidence") else 0
+            "confidence": (detections.get("confidence") or [])[selected_index]
+            if selected_index < len(detections.get("confidence") or []) else 0
         }
 
     def _refine_with_hand_data(self, norm_kps: Dict, hand_data,
@@ -698,3 +860,4 @@ class PoseEstimator:
         self.rotation_filters.clear()
         self.previous_pose = None
         self.previous_rotations = None
+        self._reset_average_smoothing()

@@ -1,0 +1,4 @@
+# Full edition extras (YOLO pose backend). Install together with requirements.txt.
+ultralytics==8.4.51
+torch==2.11.0
+torchvision==0.26.0
